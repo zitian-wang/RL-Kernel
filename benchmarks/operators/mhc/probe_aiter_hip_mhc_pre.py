@@ -12,7 +12,10 @@ and then runs ``mhc_pre_gemm_sqrsum`` and ``mhc_pre_big_fuse``. This script
    two kernels called with one fixed (split_k, tile_k) for every M.
 
 Nothing is asserted: the script prints a markdown report. Needs an aiter whose
-``module_mhc`` is built or can be JIT-built (no AITER_TRITON_ONLY).
+``module_mhc`` is built or can be JIT-built (no AITER_TRITON_ONLY). With
+AITER_AOT_IMPORT=1, ``import aiter`` loads only its JIT core (the full import
+needs flydsl >= 0.2.4, which the image lacks); ``aiter.dtypes`` is then bound
+here before ``aiter.ops.mhc`` is imported.
 
 Usage:
     python benchmarks/operators/mhc/probe_aiter_hip_mhc_pre.py --output report.md
@@ -96,6 +99,11 @@ def main():
     ]
     try:
         import aiter
+
+        if not hasattr(aiter, "dtypes"):
+            from aiter.utility import dtypes
+
+            aiter.dtypes = dtypes
         from aiter.ops import mhc
 
         lines += [f"aiter: `{Path(aiter.__file__).parent}`", ""]
