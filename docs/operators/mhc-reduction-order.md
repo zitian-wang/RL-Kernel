@@ -38,11 +38,14 @@ Contents:
   (measured); across versions it does not: Triton 3.8.0 keeps the layouts but
   adds a thread's own elements as a tree instead of left to right, and A's
   outputs change (section 7.5).
-- No reference implementation is batch invariant on ROCm. DeepGEMM (NVIDIA)
-  writes the sum-of-squares tree by hand and fixes every tile constant; vLLM's
-  batch-invariant mode relies on DeepGEMM on NVIDIA, its TileLang fallback
-  changes its thread count with M, and its ROCm model calls aiter's HIP
-  `mhc_pre`, which picks its K split per M.
+- NVIDIA has batch-invariant mHC paths in vLLM (DeepGEMM with the split taken
+  as for M = 1) and SGLang (DeepGEMM off in batch-invariant mode; Triton
+  `hc_mix_stats` with K slices from K). On ROCm: vLLM calls aiter's HIP
+  `mhc_pre`, which picks its K split per M and has no batch-invariant gate;
+  SGLang runs its Triton `hc_mix_stats` path on gfx950 only (with `BLOCK_M`
+  fixed on HIP) and plain PyTorch on gfx942. That SGLang kernel still relies on
+  fixed constexprs for its `tl.sum`, like A; only DeepGEMM writes the
+  sum-of-squares tree by hand.
 - Candidate B (`rl_engine/backends/rocm/mhc/fixed_order_mhc.py`) writes every
   reduction order in the kernel. Measured: the bits do not change with any
   launch parameter (96 launch configs) nor between Triton 3.7.0 and 3.8.0, the
