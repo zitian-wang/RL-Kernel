@@ -535,7 +535,42 @@ head is the same commit), `experimental/lite/megatron/lite/model/deepseek_v4/vll
   reduces dW and dbias over tokens with matmul and `.sum()`. Not batch
   invariant; mLite does not claim it is.
 
-### 6.8 Summary of the references
+### 6.8 SGLang
+
+`sgl-project/sglang` main `4003bf1` (2026-11-08), read only, not run.
+`python/sglang/srt/models/deepseek_v4_mhc.py` `_mix_stats_impl` (`:361-468`)
+picks the mix-stats path:
+
+- NVIDIA sm90/sm100 with `SGLANG_OPT_DEEPGEMM_HC_PRENORM` and batch-invariant
+  mode off: DeepGEMM / compensated bf16x3 projections; batch-invariant mode
+  disables them (`:384`).
+- `use_fused_stats` (Blackwell, some Hopper M ranges, and **gfx950**):
+  `hc_mix_stats_sinkhorn`, the same split kernel as below fused with Sinkhorn
+  ("The default split-K/Sinkhorn fusion preserves batch invariance", `:400`).
+- other CUDA: `hc_mix_stats` (`kernels/ops/layernorm/mhc.py:2237-2420`),
+  "cuBLAS/torch reductions can change order with num_tokens; this kernel keeps
+  the mixing and RMS reductions batch-invariant".
+- everything else, which includes **gfx942** (`torch.version.cuda` is None and
+  `use_fused_stats` needs gfx950): PyTorch eager `x.square().mean()` and
+  `F.linear` (`:446-449`), the DeepSeek reference arithmetic, no batch-invariance claim.
+
+`hc_mix_stats` is the closest reference to candidate A/B on AMD:
+
+- K slices from K only (`_num_slices_for`, choices 80 … 1), merged in slice
+  order (`_hc_mix_stats_reduce_kernel`); `BLOCK_K = 64`, `num_warps = 4` fixed;
+- the sum of squares is still `sq += tl.sum(x_tile * x_tile, axis=1)` per K
+  tile, i.e. its order rests on fixed constexprs, as in A;
+- `BLOCK_M` follows M on CUDA (8 / 16 / 32, "BLOCK_M 8/16/32 preserve each
+  row's K reduction order; thresholds were measured on GB300") but is fixed to
+  16 on HIP: "fp32 MFMA tile heights do not share a per-row reduction order, so
+  one height serves every M" (`_block_m_for`);
+- the projection is fp32: `input_precision="ieee"` on HIP ("Triton on AMD has
+  no tf32x3"), `tf32x3` on CUDA.
+
+The aiter mHC path (`_use_aiter_mhc`, `kernels/ops/layernorm/mhc.py:37-43`) is
+gated on gfx950 and `SGLANG_USE_AITER`.
+
+### 6.9 Summary of the references
 
 | Implementation | Σx² fused with projection | Σx² tree | Fixed by | Depends on M | BI on ROCm |
 |---|---|---|---|---|---|
@@ -545,6 +580,7 @@ head is the same commit), `experimental/lite/megatron/lite/model/deepseek_v4/vll
 | vLLM TileLang fallback | yes | written, thread count from M | `n_thr` 1024 / 512 | yes (M = 128) | no |
 | vLLM ROCm (aiter HIP) | yes | per-lane + fixed bpermute | `split_k`, `tile_k`, `tile_n` from M | yes | no |
 | vLLM BI RMSNorm | — | `tl.sum` per 1024 chunk | fixed constexprs | no | compiler-dependent |
+| SGLang `hc_mix_stats` | yes | `tl.sum` per 64 tile | slices from K; `BLOCK_K`, `num_warps` fixed; `BLOCK_M` fixed on HIP | no | used on gfx950 only; gfx942 runs eager PyTorch |
 | aiter Triton (A) | yes | `tl.sum`, layout from config | per-M table, layouts held equal | no (measured) | compiler-dependent |
 
 ## 7. Candidates
