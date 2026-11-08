@@ -22,6 +22,9 @@ changed from a reference config of the same bit class), this script
 
 Nothing is asserted: the script prints a markdown report. ``--layouts-only``
 skips step 1 (one launch per config at M = 17), e.g. to compare Triton versions.
+``--digest FILE`` instead writes SHA-256 digests of every output of the three
+class references for every input kind and M; with ``--compare OTHER`` it prints
+which of them differ from OTHER (e.g. another Triton version).
 
 Usage (GPU; aiter with the DeepSeek-V4 mHC ops and AITER_TRITON_ONLY=1):
     python benchmarks/operators/mhc/analyze_aiter_reductions.py --output report.md
@@ -30,6 +33,8 @@ Usage (GPU; aiter with the DeepSeek-V4 mHC ops and AITER_TRITON_ONLY=1):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
 import socket
 import sys
@@ -384,13 +389,57 @@ def to_markdown(studies, layouts_only):
     return "\n".join(lines)
 
 
+def digests(head_ref):
+    """{(class, kind, M, output): sha256} for the three class references."""
+    classes = [
+        ("pre NUM_KSPLIT=1", PRE_SPLIT1_REF, run_pre, PRE_OUTPUTS, PRE_ROWS, 3),
+        ("pre NUM_KSPLIT=4", PRE_SPLIT4_REF, run_pre, PRE_OUTPUTS, PRE_ROWS, 3),
+        ("head", head_ref, run_head, ("output",), N, 1),
+    ]
+    result = {}
+    for name, config, run, outputs, rows, scale_count in classes:
+        for kind in KINDS:
+            scale, base = scale_base(scale_count, rows)
+            fn = fn_matrix(kind, rows)
+            for m in M_VALUES:
+                outs = run(config, (residual(kind, m), fn, scale, base))
+                for out_name, out in zip(outputs, outs):
+                    bits = out.contiguous().view(
+                        {torch.float32: torch.int32, torch.bfloat16: torch.int16}[out.dtype]
+                    )
+                    key = f"{name} | {kind} | M={m} | {out_name}"
+                    result[key] = hashlib.sha256(bits.cpu().numpy().tobytes()).hexdigest()
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output", help="also write the markdown report to this file")
     parser.add_argument("--layouts-only", action="store_true")
+    parser.add_argument("--digest", help="write output digests (JSON) to this file instead")
+    parser.add_argument("--compare", help="with --digest: compare with this digest file")
     args = parser.parse_args()
 
     head_ref = aiter_head_config()
+    if args.digest:
+        result = digests(head_ref)
+        Path(args.digest).write_text(
+            json.dumps({"triton": triton.__version__, "digests": result}, indent=1)
+        )
+        if args.compare:
+            other = json.loads(Path(args.compare).read_text())
+            lines = [
+                f"| class | input | M | output | triton {other['triton']} vs {triton.__version__} |",
+                "|---|---|---|---|---|",
+            ]
+            for key, value in result.items():
+                same = "same" if other["digests"].get(key) == value else "differs"
+                lines.append("| " + " | ".join(key.split(" | ")) + f" | {same} |")
+            report = "\n".join(lines)
+            print(report)
+            if args.output:
+                Path(args.output).write_text(report + "\n")
+        return
     studies = [
         study(
             "mhc_pre, NUM_KSPLIT=1 (_mhc_fused_kernel)",
