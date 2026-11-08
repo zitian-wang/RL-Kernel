@@ -94,7 +94,8 @@ def main():
     lines = [
         "# aiter HIP mhc_pre: batch invariance",
         "",
-        f"Host `{socket.gethostname()}`, {torch.cuda.get_device_name()}, torch {torch.__version__}.",
+        f"Host `{socket.gethostname()}`, {torch.cuda.get_device_name()}, "
+        f"torch {torch.__version__}.",
         "",
     ]
     try:
@@ -111,9 +112,11 @@ def main():
         lines += ["| M | get_mhc_pre_splitk (split_k, tile_k) |", "|---|---|"]
         for m in M_VALUES:
             lines.append(f"| {m} | {mhc.get_mhc_pre_splitk(m, K)} |")
-        lines += ["", "| M | mhc_pre as is | " + " | ".join(f"fixed split_k={s}, tile_k={t}" for s, t in FIXED) + " |",
-                  "|---|---|" + "---|" * len(FIXED)]
-        runs = [lambda r: mhc.mhc_pre(r, fn, scale, base, hc_post_mult_value=2.0, sinkhorn_repeat=20)]
+        fixed_cols = " | ".join(f"fixed split_k={s}, tile_k={t}" for s, t in FIXED)
+        lines += ["", f"| M | mhc_pre as is | {fixed_cols} |", "|---|---|" + "---|" * len(FIXED)]
+        runs = [
+            lambda r: mhc.mhc_pre(r, fn, scale, base, hc_post_mult_value=2.0, sinkhorn_repeat=20)
+        ]
         runs += [lambda r, s=s, t=t: run_fixed(mhc, r, fn, scale, base, s, t) for s, t in FIXED]
         for m in M_VALUES:
             cells = []

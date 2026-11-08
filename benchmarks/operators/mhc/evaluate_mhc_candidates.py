@@ -95,7 +95,10 @@ HEAD_LAUNCH_VARIANTS = [v for v in PRE_LAUNCH_VARIANTS if "SINKHORN_BLOCK_M" not
 PERF_PRENORM = [
     {"BLOCK_M": bm, "num_warps": w} for bm, w in itertools.product([16, 32, 64], [2, 4, 8])
 ]
-PERF_APPLY = [{"APPLY_BLOCK_M": 32, "APPLY_BLOCK_C": 128}, {"APPLY_BLOCK_M": 64, "APPLY_BLOCK_C": 64}]
+PERF_APPLY = [
+    {"APPLY_BLOCK_M": 32, "APPLY_BLOCK_C": 128},
+    {"APPLY_BLOCK_M": 64, "APPLY_BLOCK_C": 64},
+]
 
 
 def _gen(seed):
@@ -146,7 +149,9 @@ def variants(pre_w, head_w):
     }
     for s in SPLITS:
         table[f"B S={s}"] = (
-            lambda r, s=s, cfg=None: flat_pre(fixed_order_mhc_pre(r, *pre_w, k_splits=s, config=cfg)),
+            lambda r, s=s, cfg=None: flat_pre(
+                fixed_order_mhc_pre(r, *pre_w, k_splits=s, config=cfg)
+            ),
             lambda r, s=s, cfg=None: [fixed_order_mhc_head(r, *head_w, k_splits=s, config=cfg)],
         )
     table["D S=4"] = (
@@ -182,9 +187,15 @@ def section_launch_invariance(pre_w, head_w):
         "|---|---|---|---|",
     ]
     inputs = {m: residual(m, seed=10 + m) for m in INVARIANCE_M}
+    def run_pre(r, s, cfg):
+        return list(fixed_order_mhc_pre(r, *pre_w, k_splits=s, config=cfg))
+
+    def run_head(r, s, cfg):
+        return [fixed_order_mhc_head(r, *head_w, k_splits=s, config=cfg)]
+
     for op, run, launch_variants in (
-        ("pre", lambda r, s, cfg: list(fixed_order_mhc_pre(r, *pre_w, k_splits=s, config=cfg)), PRE_LAUNCH_VARIANTS),
-        ("head", lambda r, s, cfg: [fixed_order_mhc_head(r, *head_w, k_splits=s, config=cfg)], HEAD_LAUNCH_VARIANTS),
+        ("pre", run_pre, PRE_LAUNCH_VARIANTS),
+        ("head", run_head, HEAD_LAUNCH_VARIANTS),
     ):
         for s in SPLITS:
             ref = {m: run(inputs[m], s, None) for m in INVARIANCE_M}
@@ -232,7 +243,8 @@ def section_batch_invariance(table, pre_w, head_w):
         "last position of a batch of M; chunking, reordering and padding; other strides; "
         f"two runs. M = {BI_M}.",
         "",
-        "| variant | op | batch (M with a difference) | chunk/reorder/pad | strides | repeated runs |",
+        "| variant | op | batch (M with a difference) | chunk/reorder/pad | strides "
+        "| repeated runs |",
         "|---|---|---|---|---|---|",
     ]
     pre_out, head_out = ["post_mix", "comb_mix", "layer_input"], ["output"]
@@ -249,7 +261,9 @@ def section_batch_invariance(table, pre_w, head_w):
             pre_out,
             lambda r: [
                 t.reshape(t.shape[0], -1) if t.dim() == 3 and t.shape[-1] == 1 else t
-                for t in fixed_order_mhc_pre(r, *pre_w, k_splits=4, config=_m_dependent_config(r.shape[0]))
+                for t in fixed_order_mhc_pre(
+                    r, *pre_w, k_splits=4, config=_m_dependent_config(r.shape[0])
+                )
             ],
         )
     )
@@ -263,7 +277,11 @@ def section_batch_invariance(table, pre_w, head_w):
                     r,
                     *head_w,
                     k_splits=4,
-                    config={k: v for k, v in _m_dependent_config(r.shape[0]).items() if k != "SINKHORN_BLOCK_M"},
+                    config={
+                        k: v
+                        for k, v in _m_dependent_config(r.shape[0]).items()
+                        if k != "SINKHORN_BLOCK_M"
+                    },
                 )
             ],
         )
@@ -273,7 +291,9 @@ def section_batch_invariance(table, pre_w, head_w):
         try:
             batch = {m: bi.differing_in_batch(case, m) for m in BI_M}
             batch_cell = "; ".join(f"M={m}: {','.join(d)}" for m, d in batch.items() if d) or "none"
-            chunk = sorted({n for m in (17, 1024) for n in bi.differing_after_chunk_reorder_pad(case, m)})
+            chunk = sorted(
+                {n for m in (17, 1024) for n in bi.differing_after_chunk_reorder_pad(case, m)}
+            )
             stride = sorted({n for m in (17, 1024) for n in bi.differing_after_restride(case, m)})
             runs = sorted({n for m in (17, 1024) for n in bi.differing_between_runs(case, m)})
             lines.append(
@@ -303,7 +323,8 @@ def section_accuracy(table, pre_w, head_w):
         "`NativeMHCHeadOp.forward_fp32` (fp32 projection with fp32 fn). Max and mean absolute "
         "error per output.",
         "",
-        "| variant | post_mix max / mean | comb_mix max / mean | layer_input max / mean | head output max / mean |",
+        "| variant | post_mix max / mean | comb_mix max / mean | layer_input max / mean "
+        "| head output max / mean |",
         "|---|---|---|---|---|",
     ]
     for name, (pre, head) in table.items():
@@ -326,7 +347,7 @@ def section_accuracy(table, pre_w, head_w):
     return lines
 
 
-# --- 4. device time --------------------------------------------------------------------------------
+# --- 4. device time ---------------------------------------------------------------------------
 
 
 def _measure(call):
@@ -369,7 +390,8 @@ def section_perf(pre_w, head_w):
     b_configs = [dict(p, **a) for p, a in itertools.product(PERF_PRENORM, PERF_APPLY)]
     lines = []
     for op in ("pre", "head"):
-        names = ["aiter default", "A"] + [f"B S={s}" for s in SPLITS] + (["D S=4"] if op == "pre" else [])
+        names = ["aiter default", "A"] + [f"B S={s}" for s in SPLITS]
+        names += ["D S=4"] if op == "pre" else []
         lines += [
             f"## 4{'a' if op == 'pre' else 'b'}. Device time, mhc_{op}",
             "",
@@ -387,25 +409,31 @@ def section_perf(pre_w, head_w):
             r = residual(m, seed=3)
             results = {}
             if op == "pre":
-                results["aiter default"] = _measure(lambda: mhc_pre_dsv4(r, *pre_w, sinkhorn_repeat=20))
-                results["A"] = _measure(lambda: a_pre(r, *pre_w))
+                results["aiter default"] = _measure(
+                    lambda r=r: mhc_pre_dsv4(r, *pre_w, sinkhorn_repeat=20)
+                )
+                results["A"] = _measure(lambda r=r: a_pre(r, *pre_w))
                 for s in SPLITS:
                     results[f"B S={s}"], _ = _best(
-                        lambda cfg, s=s: lambda: fixed_order_mhc_pre(r, *pre_w, k_splits=s, config=cfg),
+                        lambda cfg, s=s, r=r: lambda: fixed_order_mhc_pre(
+                            r, *pre_w, k_splits=s, config=cfg
+                        ),
                         b_configs,
                     )
                 results["D S=4"], _ = _best(
-                    lambda cfg: lambda: fixed_order_mhc_pre(
+                    lambda cfg, r=r: lambda: fixed_order_mhc_pre(
                         r, *pre_w, k_splits=4, config=cfg, projection="aiter_linear"
                     ),
                     b_configs,
                 )
             else:
-                results["aiter default"] = _measure(lambda: mhc_head_dsv4(r, *head_w))
-                results["A"] = _measure(lambda: a_head(r, *head_w))
+                results["aiter default"] = _measure(lambda r=r: mhc_head_dsv4(r, *head_w))
+                results["A"] = _measure(lambda r=r: a_head(r, *head_w))
                 for s in SPLITS:
                     results[f"B S={s}"], _ = _best(
-                        lambda cfg, s=s: lambda: fixed_order_mhc_head(r, *head_w, k_splits=s, config=cfg),
+                        lambda cfg, s=s, r=r: lambda: fixed_order_mhc_head(
+                            r, *head_w, k_splits=s, config=cfg
+                        ),
                         b_configs,
                     )
             base = results["A"]
@@ -455,8 +483,9 @@ def header():
     return [
         "# Batch-invariant mHC candidates on ROCm",
         "",
-        f"Host `{socket.gethostname()}`, {torch.cuda.get_device_name()}, torch {torch.__version__}, "
-        f"triton {triton.__version__}. n={N}, C={C}, K={K}, 20 Sinkhorn rounds.",
+        f"Host `{socket.gethostname()}`, {torch.cuda.get_device_name()}, "
+        f"torch {torch.__version__}, triton {triton.__version__}. "
+        f"n={N}, C={C}, K={K}, 20 Sinkhorn rounds.",
         "",
     ]
 
@@ -472,7 +501,9 @@ def main():
     pre_w, head_w = pre_weights(), head_weights()
     if args.digest:
         result = digests(pre_w, head_w)
-        Path(args.digest).write_text(json.dumps({"triton": triton.__version__, "digests": result}, indent=1))
+        Path(args.digest).write_text(
+            json.dumps({"triton": triton.__version__, "digests": result}, indent=1)
+        )
         if args.compare:
             other = json.loads(Path(args.compare).read_text())
             print(f"| output | triton {other['triton']} vs {triton.__version__} |\n|---|---|")

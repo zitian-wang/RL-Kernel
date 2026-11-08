@@ -81,6 +81,19 @@ def _pairwise_max_last(v, ROWS: tl.constexpr, WIDTH: tl.constexpr, LOG2_WIDTH: t
 
 
 @triton.jit
+def _row_sums(p, BLOCK_M: tl.constexpr, NS: tl.constexpr, LOG2_NS: tl.constexpr):
+    """[BLOCK_M, NS, NS] -> [BLOCK_M, NS]: sum over the last axis, pairwise."""
+    flat = tl.reshape(p, (BLOCK_M * NS, NS))
+    return tl.reshape(_pairwise_sum_last(flat, BLOCK_M * NS, NS, LOG2_NS), (BLOCK_M, NS))
+
+
+@triton.jit
+def _col_sums(p, BLOCK_M: tl.constexpr, NS: tl.constexpr, LOG2_NS: tl.constexpr):
+    """[BLOCK_M, NS, NS] -> [BLOCK_M, NS]: sum over the middle axis, pairwise."""
+    return _row_sums(tl.permute(p, (0, 2, 1)), BLOCK_M, NS, LOG2_NS)
+
+
+@triton.jit
 def _prenorm_kernel(
     x_ptr,
     fn_ptr,
@@ -131,7 +144,10 @@ def _prenorm_kernel(
     row_sq = _pairwise_sum_last(sq, BLOCK_M, BLOCK_K, LOG2_BLOCK_K)
     if WITH_DOT:
         tl.store(
-            acc_ptr + pid_s * stride_acc_s + rm[:, None] * stride_acc_m + rn[None, :] * stride_acc_n,
+            acc_ptr
+            + pid_s * stride_acc_s
+            + rm[:, None] * stride_acc_m
+            + rn[None, :] * stride_acc_n,
             acc,
             mask=(rm[:, None] < M) & (rn[None, :] < N),
         )
@@ -194,7 +210,9 @@ def _pre_apply_kernel(
     li = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
     tile_ok = row_ok[:, None] & (rc[None, :] < C)
     for i in tl.static_range(NS):
-        h = _merge_splits(acc_ptr, rm * stride_acc_m + i * stride_acc_n, row_ok, stride_acc_s, ACC_SPLITS)
+        h = _merge_splits(
+            acc_ptr, rm * stride_acc_m + i * stride_acc_n, row_ok, stride_acc_s, ACC_SPLITS
+        )
         pre = tl.sigmoid(rsigma * alpha_pre * h + tl.load(base_ptr + i)) + pre_eps
         xi = tl.load(
             x_ptr + rm[:, None] * stride_xm + (i * C + rc[None, :]) * stride_xk,
@@ -226,7 +244,9 @@ def _pre_apply_kernel(
         bias = tl.load(base_ptr + NS + j, mask=col_ok, other=0.0)
         logits = rsigma[:, None] * alpha[None, :] * acc_mix + bias[None, :]
         mix = tl.where(j[None, :] < NS, tl.sigmoid(logits) * post_mult, logits)
-        tl.store(mix_ptr + rm[:, None] * stride_mix_m + j[None, :] * stride_mix_n, mix, mask=mix_mask)
+        tl.store(
+            mix_ptr + rm[:, None] * stride_mix_m + j[None, :] * stride_mix_n, mix, mask=mix_mask
+        )
 
 
 @triton.jit
@@ -250,30 +270,20 @@ def _sinkhorn_kernel(
     ri = tl.arange(0, NS)
     entry = ri[None, :, None] * NS + ri[None, None, :]
     mask = (rm[:, None, None] < M) & (entry >= 0)
-    a = tl.load(logits_ptr + rm[:, None, None] * stride_lm + entry * stride_ln, mask=mask, other=0.0)
+    a = tl.load(
+        logits_ptr + rm[:, None, None] * stride_lm + entry * stride_ln, mask=mask, other=0.0
+    )
     if ITERS > 0:
         row_max = tl.reshape(
             _pairwise_max_last(tl.reshape(a, (BLOCK_M * NS, NS)), BLOCK_M * NS, NS, LOG2_NS),
             (BLOCK_M, NS),
         )
         p = tl.exp(a - row_max[:, :, None])
-        row_sum = tl.reshape(_pairwise_sum_last(tl.reshape(p, (BLOCK_M * NS, NS)), BLOCK_M * NS, NS, LOG2_NS), (BLOCK_M, NS))
-        p = p / row_sum[:, :, None] + eps
-        col_sum = tl.reshape(
-            _pairwise_sum_last(tl.reshape(tl.permute(p, (0, 2, 1)), (BLOCK_M * NS, NS)), BLOCK_M * NS, NS, LOG2_NS),
-            (BLOCK_M, NS),
-        )
-        p = p / (col_sum[:, None, :] + eps)
+        p = p / _row_sums(p, BLOCK_M, NS, LOG2_NS)[:, :, None] + eps
+        p = p / (_col_sums(p, BLOCK_M, NS, LOG2_NS)[:, None, :] + eps)
         for _ in range(ITERS - 1):
-            row_sum = tl.reshape(
-                _pairwise_sum_last(tl.reshape(p, (BLOCK_M * NS, NS)), BLOCK_M * NS, NS, LOG2_NS), (BLOCK_M, NS)
-            )
-            p = p / (row_sum[:, :, None] + eps)
-            col_sum = tl.reshape(
-                _pairwise_sum_last(tl.reshape(tl.permute(p, (0, 2, 1)), (BLOCK_M * NS, NS)), BLOCK_M * NS, NS, LOG2_NS),
-                (BLOCK_M, NS),
-            )
-            p = p / (col_sum[:, None, :] + eps)
+            p = p / (_row_sums(p, BLOCK_M, NS, LOG2_NS)[:, :, None] + eps)
+            p = p / (_col_sums(p, BLOCK_M, NS, LOG2_NS)[:, None, :] + eps)
         a = p
     tl.store(out_ptr + rm[:, None, None] * stride_om + entry * stride_on, a, mask=mask)
 
@@ -317,7 +327,9 @@ def _head_apply_kernel(
     out = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
     tile_ok = row_ok[:, None] & (rc[None, :] < C)
     for i in tl.static_range(NS):
-        h = _merge_splits(acc_ptr, rm * stride_acc_m + i * stride_acc_n, row_ok, stride_acc_s, ACC_SPLITS)
+        h = _merge_splits(
+            acc_ptr, rm * stride_acc_m + i * stride_acc_n, row_ok, stride_acc_s, ACC_SPLITS
+        )
         mix = tl.sigmoid(h * rsigma * scale + tl.load(base_ptr + i)) + pre_eps
         xi = tl.load(
             x_ptr + rm[:, None] * stride_xm + (i * C + rc[None, :]) * stride_xk,

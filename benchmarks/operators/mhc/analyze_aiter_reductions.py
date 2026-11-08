@@ -186,7 +186,8 @@ def reductions(ttgir):
 def dot_operands(ttgir):
     """Distinct (opIdx, kWidth) of dot operands and the MFMA layouts."""
     aliases = dict(_ALIAS.findall(ttgir))
-    ops = sorted(set(re.findall(r"#ttg\.dot_op<\{opIdx = (\d), parent = [^,]+, kWidth = (\d+)\}>", ttgir)))
+    pattern = r"#ttg\.dot_op<\{opIdx = (\d), parent = [^,]+, kWidth = (\d+)\}>"
+    ops = sorted(set(re.findall(pattern, ttgir)))
     mfma = sorted({v for v in aliases.values() if "amd_mfma" in v})
     return ops, mfma
 
@@ -323,13 +324,15 @@ def study(name, reference, variants, run, kernels, output_names, rows, scale_cou
 
     ref_out, ref_compiled = launch(reference)
     ref_layouts, ref_dots = summarize_layouts(ref_compiled, reference)
-    rows_out = [(_label(reference, reference), {k: "reference" for k in kinds}, ref_layouts, ref_dots)]
+    ref_cells = {k: "reference" for k in kinds}
+    rows_out = [(_label(reference, reference), ref_cells, ref_layouts, ref_dots)]
     for change in variants:
         config = dict(reference, **change)
         try:
             outs, compiled = launch(config)
         except Exception as exc:  # a config can exceed LDS or registers
-            rows_out.append((_label(config, reference), f"cannot launch: {type(exc).__name__}", {}, ""))
+            failed = f"cannot launch: {type(exc).__name__}"
+            rows_out.append((_label(config, reference), failed, {}, ""))
             continue
         cells = {}
         for kind in kinds:
@@ -352,7 +355,8 @@ def to_markdown(studies, layouts_only):
     lines = [
         "# aiter mHC reductions: bits and layouts per launch config",
         "",
-        f"Host `{socket.gethostname()}`, {torch.cuda.get_device_name()}, torch {torch.__version__}, "
+        f"Host `{socket.gethostname()}`, {torch.cuda.get_device_name()}, "
+        f"torch {torch.__version__}, "
         f"triton {triton.__version__}. n={N}, C={C}, K={K}, M in "
         f"{M_VALUES[:1] if layouts_only else M_VALUES}. Bits are compared with the class "
         "reference (first row) for the same inputs; layout cells give, for the operand of "
@@ -429,7 +433,8 @@ def main():
         if args.compare:
             other = json.loads(Path(args.compare).read_text())
             lines = [
-                f"| class | input | M | output | triton {other['triton']} vs {triton.__version__} |",
+                f"| class | input | M | output "
+                f"| triton {other['triton']} vs {triton.__version__} |",
                 "|---|---|---|---|---|",
             ]
             for key, value in result.items():
