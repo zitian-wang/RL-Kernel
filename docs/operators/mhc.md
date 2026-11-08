@@ -98,6 +98,19 @@ splits K into 4 segments with `BLOCK_K=128` at every M. mhc_head's public
 `config` cannot set `num_warps` or `num_stages`, so its table only changes
 `waves_per_eu`. mhc_post's config does not depend on M and is aiter's.
 
+`BLOCK_K` changes the bits through the RMS sum of squares
+(`acc_sq += tl.sum(x * x, axis=1)`), not through the projection (`tl.dot`).
+Measured on MI325X, Triton 3.7, n = 4, C = 4096, M = 17 and 1024 (job
+68297426): with inputs whose sum of squares is exact in any order (entries in
+{±1, ±2}), `BLOCK_K` = 32, 64, 256 against 128 (mhc_pre, `NUM_KSPLIT` = 1 and
+4) and 32, 128, 256 against 64 (mhc_head) give the same bits; with an exact
+projection (one-hot `fn`) and random inputs they differ, e.g. mhc_pre
+`NUM_KSPLIT=4`, `BLOCK_K=32`: post_mix 525/4096, comb_mix 3754/16384 elements
+at M = 1024. `BLOCK_C=256` on mhc_pre changes only `layer_input`, that is the
+stream sum `tl.sum(pre_mix * x, axis=1)`. Why these parameters change the bits,
+the reference implementations and the candidates for a fixed reduction order:
+[mHC Reduction Order and Batch Invariance on ROCm](mhc-reduction-order.md).
+
 `rl_engine.backends.rocm.config_utils.selected_configs()` lists the configs that
 ran in the process, one record per GPU arch, op, table file and bucket: `arch`,
 `op`, `file`, `bucket` (`M_LEQ_x`, `"any"`, or `"default"` without a table),

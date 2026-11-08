@@ -35,4 +35,5 @@ Every operator page should include:
 - [Final Logit Softcap](final-logit-softcap.md)
 - [Batch-Invariant Linear (ROCm)](batch-invariant-linear.md)
 - [DeepSeek-V4 mHC and Layer End](mhc.md)
+- [mHC Reduction Order and Batch Invariance on ROCm](mhc-reduction-order.md)
 - [Operator Doc Template](../contributing/operator-doc-template.md)
