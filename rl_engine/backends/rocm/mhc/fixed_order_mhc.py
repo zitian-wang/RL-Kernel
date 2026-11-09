@@ -2,7 +2,8 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """DeepSeek-V4 mHC pre and head on Triton with every reduction order written in the kernel.
 
-Candidate B of docs/operators/mhc-reduction-order.md; not registered as an op.
+The ``fixed_order`` approach of docs/operators/mhc-reduction-order.md; not registered
+as an op.
 aiter's kernels leave two reductions to ``tl.sum``, whose tree follows the tile
 layout Triton derives from BLOCK_M, BLOCK_K, BLOCK_C and num_warps: the RMS sum
 of squares inside each K tile and the sum over the n residual streams. Here no
@@ -22,9 +23,10 @@ reduction depends on a launch parameter:
 BLOCK_M, num_warps, num_stages, waves_per_eu and the tile sizes of the apply and
 Sinkhorn kernels only regroup rows and columns.
 
-``fixed_order_mhc_pre(..., projection="aiter_linear")`` is candidate D: the
-projection runs as aiter's gemm_a16w16 with the batch-invariant linear's config,
-and only the sum of squares runs in the kernel below (x is read once more).
+``fixed_order_mhc_pre(..., projection="aiter_linear")`` is the
+``separate_projection`` approach: the projection runs as aiter's gemm_a16w16 with
+the batch-invariant linear's config, and only the sum of squares runs in the
+kernel below (x is read once more).
 """
 
 from __future__ import annotations
@@ -417,7 +419,7 @@ def fixed_order_mhc_pre(
 
     Returns (post_mix [M, n, 1] fp32, comb_mix [M, n, n] fp32, layer_input [M, C]).
     ``projection="aiter_linear"`` runs the projection as aiter's gemm_a16w16
-    (candidate D) instead of in the K loop of the sum of squares.
+    (the ``separate_projection`` approach) instead of in the K loop of the sum of squares.
     """
     cfg = dict(DEFAULT_PRE_CONFIG, **(config or {}))
     m, n, c = residual.shape

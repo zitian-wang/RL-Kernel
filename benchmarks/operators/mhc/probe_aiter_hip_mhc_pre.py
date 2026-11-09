@@ -2,8 +2,8 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """aiter's HIP mHC pre (``aiter.ops.mhc.mhc_pre``), the op vLLM's ROCm DeepSeek-V4 model
 calls for mHC pre and, with a zero-padded fn and no Sinkhorn, for mHC head
-(vllm/_aiter_ops.py ``rocm_aiter_ops.mhc_pre`` / ``hc_head``): candidate E of
-docs/operators/mhc-reduction-order.md.
+(vllm/_aiter_ops.py ``rocm_aiter_ops.mhc_pre`` / ``hc_head``): the ``aiter_hip``
+approach of docs/operators/mhc-reduction-order.md.
 
 ``mhc_pre`` picks the number of K splits and tile_k per M (``get_mhc_pre_splitk``)
 and then runs ``mhc_pre_gemm_sqrsum`` and ``mhc_pre_big_fuse``. "fixed" variants
@@ -16,7 +16,9 @@ call the two kernels with one (split_k, tile_k) for every M. Sections:
 4. device time per M, same method and inputs as evaluate_mhc_candidates.py section 4.
 
 Nothing is asserted: the script prints a markdown report. Needs an aiter whose
-``module_mhc`` is built or can be JIT-built (no AITER_TRITON_ONLY). With
+``module_mhc`` is built or can be JIT-built (no AITER_TRITON_ONLY); the JIT build
+needs the composable_kernel headers in aiter's 3rdparty/composable_kernel, which
+must be populated at aiter's submodule commit. With
 AITER_AOT_IMPORT=1, ``import aiter`` loads only its JIT core (the full import
 needs flydsl >= 0.2.4, which the image lacks); ``aiter.dtypes`` is then bound
 here before ``aiter.ops.mhc`` is imported.
@@ -105,7 +107,7 @@ def variants(mhc, pre_w, head_w):
         return [post.reshape(post.shape[0], N), comb.reshape(comb.shape[0], N, N), li]
 
     table = {
-        "E aiter split": (
+        "aiter_hip, split by M": (
             lambda r: flat(mhc.mhc_pre(r, *pre_w, hc_post_mult_value=2.0, sinkhorn_repeat=20)),
             lambda r: [
                 mhc.mhc_pre(r, *head_full, EPS, EPS, 0.0, 1.0, 0)[2],
@@ -113,7 +115,7 @@ def variants(mhc, pre_w, head_w):
         )
     }
     for s, t in FIXED:
-        table[f"E fixed {s}x{t}"] = (
+        table[f"aiter_hip, split_k={s} tile_k={t}"] = (
             lambda r, s=s, t=t: flat(pre_fixed(mhc, r, *pre_w, s, t)),
             lambda r, s=s, t=t: [pre_fixed(mhc, r, *head_full, s, t, 0, 1.0)[2]],
         )
@@ -229,7 +231,7 @@ def main():
     parser.add_argument("--output")
     args = parser.parse_args()
     lines = [
-        "# aiter HIP mhc_pre (candidate E)",
+        "# aiter HIP mhc_pre (aiter_hip approach)",
         "",
         f"Host `{socket.gethostname()}`, {torch.cuda.get_device_name()}, "
         f"torch {torch.__version__}.",

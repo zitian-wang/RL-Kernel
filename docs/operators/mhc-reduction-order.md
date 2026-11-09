@@ -1,894 +1,794 @@
 # mHC Reduction Order and Batch Invariance on ROCm
 
-Investigation for DSV4 RFC tasks 1 and 8 ([#508](https://github.com/RL-Align/RL-Kernel/issues/508)),
-branch `feat/issue-81-mhc-bi-reduction`. Every statement below is either read
-in the cited source (file:line) or measured in the cited Slurm job; the few
-inferences are marked **inferred**. Section 7 lists the candidates with their
-measured trade-offs; the choice between them is open.
+This page explains why the DeepSeek-V4 mHC pre and mHC head kernels that
+RL-Kernel takes from aiter give a token different result bits when launch
+parameters change, how other projects deal with the same problem, and which
+approaches we measured to fix the order of every sum. It belongs to DSV4 RFC
+tasks 1 and 8 ([#508](https://github.com/RL-Align/RL-Kernel/issues/508)) and to
+the branch `feat/issue-81-mhc-bi-reduction`. Which approach to adopt is not
+decided yet.
 
-Contents:
+Each statement is either read in the source file cited next to it or measured
+in the Slurm job cited next to it. The few statements that are neither are
+marked "not verified".
 
-1. [Summary](#1-summary)
-2. [What mHC pre and head reduce](#2-what-mhc-pre-and-head-reduce)
-3. [How aiter computes them and picks launch configs](#3-how-aiter-computes-them-and-picks-launch-configs)
-4. [Why a launch parameter changes the bits](#4-why-a-launch-parameter-changes-the-bits)
-5. [Measured attribution and layouts](#5-measured-attribution-and-layouts)
-6. [Reference implementations](#6-reference-implementations)
-7. [Candidates](#7-candidates)
-8. [How this was found](#8-how-this-was-found)
-9. [Reproduction](#9-reproduction)
+## Terms used on this page
+
+**Shapes.** One token holds `n = 4` residual streams of hidden size `C = 4096`
+(DeepSeek-V4-Flash). `K = n × C = 16384` is the length of one token's flattened
+streams. `M` is the number of tokens in the batch.
+
+**Batch invariant.** A kernel is batch invariant when the bits of a token's
+outputs do not depend on which other tokens are in the batch, and therefore not
+on `M`. RL-Kernel checks this with `rl_engine/validation/common/batch_invariance.py`:
+a token computed alone is compared bit for bit with the same token placed in
+batches of many sizes, after chunking, reordering and padding, and with
+non-contiguous inputs.
+
+**Reduction order.** Floating-point addition is not associative, so a sum of
+many numbers can round differently when the numbers are added in a different
+grouping. The grouping is the reduction order. A kernel is batch invariant when
+the reduction order of every sum depends only on the token's own data.
+
+**Launch parameters.** The Triton kernels discussed here take tile sizes as
+compile-time constants: `BLOCK_M` (tokens per workgroup), `BLOCK_K` (step of the
+loop over K), `BLOCK_C` (hidden positions per workgroup in the final weighted
+sum), `NUM_KSPLIT` (number of K segments computed by different workgroups and
+added afterwards), plus Triton's own options `num_warps`, `num_stages`,
+`waves_per_eu`, `kpack` and `matrix_instr_nonkdim`.
+
+**Layout of a tensor in Triton.** When a Triton kernel holds a tile such as
+`[BLOCK_M, BLOCK_K]` in registers, the compiler decides how the tile is spread
+over the GPU threads. Along one axis this is three numbers: how many
+consecutive elements one thread holds ("elements per thread"), how many lanes
+of a wavefront the axis is spread over ("lanes"; a wavefront has 64 lanes on
+gfx942), and how many wavefronts the axis is spread over ("warps").
+
+**The approaches compared** (section 7). Each name says what the approach does:
+
+| Name | What it is |
+|---|---|
+| `aiter_own_config` | aiter's Triton mHC ops with the launch config aiter chooses for each `M`. Not batch invariant; shown for reference. |
+| `aiter_config_table` | The current RL-Kernel ops on the PR branch: aiter's Triton mHC ops with a launch config per `M` from RL-Kernel's tables, chosen so that the result bits are the same for every `M`. The baseline of every comparison. |
+| `fixed_order` | New Triton kernels in RL-Kernel (`rl_engine/backends/rocm/mhc/fixed_order_mhc.py`) whose every sum is written in the kernel source, so no launch parameter can change its order. |
+| `fixed_order_in_aiter_fork` | The same kernels as `fixed_order`, but kept in a fork of aiter that RL-Kernel pins. |
+| `separate_projection` | mHC pre with the projection computed by aiter's `gemm_a16w16` (RL-Kernel's batch-invariant linear) and the sum of squares by the `fixed_order` kernel. |
+| `aiter_hip` | aiter's HIP mHC pre kernels (`aiter.ops.mhc`), the ones vLLM uses on ROCm, called with one fixed number of K segments for every `M`. |
 
 ## 1. Summary
 
-- mHC pre and head each contain two long reductions per token and one short
-  one: the projection `x @ fn^T` and the RMS sum of squares `Σ x²`, both over
-  K = n·C = 16384, and the weighted sum over the n = 4 residual streams.
-- In aiter's Triton kernels the projection is `tl.dot`; its bits change only
-  with how K is split (`NUM_KSPLIT`) and with `kpack`. Tile sizes, `num_warps`
-  and the MFMA instruction shape do not change them.
-- The sum of squares and the stream sum are `tl.sum`. Triton 3.7 lowers `tl.sum`
-  into a per-thread sequential sum, a lane butterfly and, if needed, a
-  cross-warp step, and the shape of that tree is the operand's layout, which
-  Triton derives from `BLOCK_M`, `BLOCK_K`, `BLOCK_C` and `num_warps`. A launch
-  parameter changes the bits exactly when it changes that layout along the
-  reduced axis (section 5, every config measured).
-- aiter picks those parameters per M, so its own configs are not batch
-  invariant. The current RL-Kernel ops (candidate A) avoid this by giving every
-  M a config with the same layouts. Within one Triton version this holds
-  (measured); across versions it does not: Triton 3.8.0 keeps the layouts but
-  adds a thread's own elements as a tree instead of left to right, and A's
-  outputs change (section 7.5).
-- NVIDIA has batch-invariant mHC paths in vLLM (DeepGEMM with the split taken
-  as for M = 1) and SGLang (DeepGEMM off in batch-invariant mode; Triton
-  `hc_mix_stats` with K slices from K). On ROCm: vLLM calls aiter's HIP
-  `mhc_pre`, which picks its K split per M and has no batch-invariant gate;
-  SGLang runs its Triton `hc_mix_stats` path on gfx950 only (with `BLOCK_M`
-  fixed on HIP) and plain PyTorch on gfx942. That SGLang kernel still relies on
-  fixed constexprs for its `tl.sum`, like A; only DeepGEMM writes the
-  sum-of-squares tree by hand.
-- Candidate B (`rl_engine/backends/rocm/mhc/fixed_order_mhc.py`) writes every
-  reduction order in the kernel. Measured: the bits do not change with any
-  launch parameter (96 launch configs) nor between Triton 3.7.0 and 3.8.0, the
-  ops are batch invariant for M = 1 to 16384, and the error against the fp32
-  reference equals aiter's.
+- mHC pre and mHC head compute, per token, three sums: the projection
+  `x @ fn^T` and the RMS sum of squares `Σ x²`, both over the `K = 16384`
+  values of the token, and the weighted sum of the 4 residual streams.
+- In aiter's Triton kernels the projection is `tl.dot`. Its bits change only
+  when `NUM_KSPLIT` or `kpack` changes. `BLOCK_M`, `BLOCK_K`, `num_warps` and the
+  MFMA instruction shape do not change them.
+- The sum of squares and the weighted stream sum are `tl.sum`. Triton decides
+  the order of a `tl.sum` from the layout of its input, and the layout follows
+  `BLOCK_M`, `BLOCK_K`, `BLOCK_C` and `num_warps`. For each of the 39 launch
+  configs we measured, the bits changed if and only if the layout of one of the
+  sums (or the `kpack` packing of the projection) changed.
+- aiter chooses these parameters per `M`, so its own configs are not batch
+  invariant. `aiter_config_table` avoids that by giving every `M` a config with
+  the same layouts. This holds within one Triton version. Between Triton 3.7.0
+  and 3.8.0 the layouts stay the same, but 3.8.0 adds a thread's own elements
+  as a tree instead of left to right, and the outputs of `aiter_config_table`
+  change.
+- On NVIDIA, vLLM and SGLang have batch-invariant mHC paths. On ROCm neither
+  has one for gfx942: vLLM calls aiter's HIP mHC pre, which chooses its K split
+  per `M`; SGLang runs plain PyTorch on gfx942 and its batch-invariant Triton
+  kernel only on gfx950. Only DeepGEMM (NVIDIA only) writes the sum-of-squares
+  order by hand instead of relying on fixed compile-time constants.
+- `fixed_order` was measured on MI325X: its bits did not change under any of
+  96 launch configs nor between Triton 3.7.0 and 3.8.0; it is batch invariant
+  for `M` from 1 to 16384; its error against the fp32 reference equals that of
+  `aiter_config_table`; and it takes 0.68–0.96 of the baseline's time for mHC
+  pre and 0.04–0.15 for mHC head.
+- `aiter_hip` with 1, 4 or 8 K segments is batch invariant and about as fast as
+  `fixed_order`. It projects with fp32 weights, so its mixing weights are about
+  1000 times closer to the fp32 reference than those of the other approaches,
+  which round the weights to bf16. It needs aiter's HIP build and calls
+  internal aiter functions.
 
-- Device time (MI325X, forward, vs A): B with S = 4 takes 0.68–0.96× of A for
-  mhc_pre and 0.04–0.15× for mhc_head (A's head runs the whole K and C loop in
-  one workgroup per 16 rows: 0.75 ms at M = 1). D is 1.3–4.0× slower than A.
-  E (aiter's HIP mhc_pre, the op vLLM calls on ROCm) is batch invariant only
-  with a fixed small split (1, 4 or 8 segments), is as fast as B, and projects
-  with fp32 `fn`, which puts its mixing weights 1000× closer to the fp32
-  reference than A and B.
+## 2. The three sums in mHC pre and mHC head
 
-## 2. What mHC pre and head reduce
-
-DeepSeek-V4-Flash-0731 (`inference/model.py:676-680`, `:730-734`, Hugging Face
-revision `60d8d70`):
+The DeepSeek-V4-Flash reference (Hugging Face revision `60d8d70`,
+`inference/model.py:676-680` for mHC pre, `:730-734` for mHC head):
 
 ```python
-x = x.flatten(2).float()                                   # [tokens, n*C], n*C = 16384
+x = x.flatten(2).float()                                   # [tokens, K], K = 16384
 rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-mixes = F.linear(x, hc_fn) * rsqrt                         # [tokens, 24] (pre) or [tokens, 4] (head)
+mixes = F.linear(x, hc_fn) * rsqrt                         # 24 mixing values (pre) or 4 (head)
 ...
-y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)    # sum over the n = 4 streams
+y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)    # weighted sum of the 4 streams
 ```
 
-| Reduction | Length per output | Where in aiter |
+| Sum | Number of terms per output | In aiter's Triton kernels |
 |---|---|---|
-| projection `x @ fn^T` | K = 16384 | `tl.dot` in the K loop |
-| sum of squares `Σ x²` | K = 16384 | `tl.sum(x*x, axis=1)` per K tile, in the same K loop |
-| stream sum `Σ_i pre_i · x_i` | n = 4 | `tl.sum(pre[:, :, None] * x, axis=1)` per C tile |
-| Sinkhorn row/column sums (pre) | n = 4 | separate kernel, one row per workgroup |
+| projection `x @ fn^T` | 16384 | `tl.dot` inside the loop over K |
+| sum of squares `Σ x²` | 16384 | `tl.sum(x * x, axis=1)` once per `BLOCK_K` tile, inside the same loop |
+| weighted stream sum `Σ_i weight_i · x_i` | 4 | `tl.sum(weight[:, :, None] * x, axis=1)` once per `BLOCK_C` tile |
+| Sinkhorn row and column sums (mHC pre only) | 4 | separate kernel, one token per workgroup |
 
-Batch invariance (BI) here means: the bits of a token's outputs do not depend
-on the other tokens in the batch (M), checked by
-`rl_engine/validation/common/batch_invariance.py`.
+## 3. How aiter's Triton kernels compute them
 
-## 3. How aiter computes them and picks launch configs
-
-aiter `326cffa`, `aiter/ops/triton/fusions/mhc.py` (wrappers) and
-`aiter/ops/triton/_triton_kernels/fusions/mhc.py` (kernels).
+Source: aiter commit `326cffa`, `aiter/ops/triton/fusions/mhc.py` (the Python
+functions that launch the kernels) and `aiter/ops/triton/_triton_kernels/fusions/mhc.py`
+(the kernels).
 
 ### 3.1 mHC pre
 
-`mhc()` (`fusions/mhc.py:251-369`) takes one of two paths by `NUM_KSPLIT`, and
-passes the same config dict (`**config`) to every kernel it launches:
+The launcher `mhc()` (`fusions/mhc.py:251-369`) takes one of two paths and
+passes the same config dictionary to every kernel it launches:
 
-- `NUM_KSPLIT = 1`: `_mhc_fused_kernel`, grid `(cdiv(M, BLOCK_M), 3)`. Each of
-  the pre, post and res workgroups runs the whole K loop (`:294-314`):
+- With `NUM_KSPLIT = 1` it launches `_mhc_fused_kernel`. Every workgroup loops
+  over the whole K (`:294-314`):
 
   ```python
   for k in range(0, K, BLOCK_K):
-      x_tile = tl.load(...)                              # [BLOCK_M, BLOCK_K] bf16
-      phi_tile = tl.load(...).to(x_ptr.dtype.element_ty) # fn rounded to bf16
+      x_tile = tl.load(...)                              # [BLOCK_M, BLOCK_K], bf16
+      phi_tile = tl.load(...).to(x_ptr.dtype.element_ty) # the fp32 weights rounded to bf16
       acc = tl.dot(x_tile, phi_tile, acc=acc)            # projection
       acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)  # sum of squares
   ```
 
-  The pre workgroup then computes the stream sum over C tiles of `BLOCK_C`
-  (`_mhc_apply_pre_mix_tile`, `:44`:
-  `li_acc = tl.sum(pre_mix_2d[:, :, None] * x_tile, axis=1)`).
-- `NUM_KSPLIT > 1`: `_mhc_fused_split_kernel` (grid `(cdiv(M, BLOCK_M),
-  NUM_KSPLIT)`, the same loop over one K segment, `:476-493`) writes partial
-  `acc` and `acc_sq`; `_mhc_reduce_apply_kernel` (grid `(cdiv(M, BLOCK_M),
-  cdiv(C, BLOCK_C))`) adds the partials in segment order (`:674-686`), applies
-  RMS, sigmoid and bias, and computes the stream sum for its C tile.
-- Sinkhorn always runs afterwards in `_mhc_asymmetric_sinkhorn_kernel`, one row
-  per workgroup, with a `num_warps` from aiter's tuned config that does not
-  depend on M (`fusions/mhc.py:1044-1060`).
+  The workgroup that owns the pre weights then computes the weighted stream
+  sum, one `BLOCK_C` tile of hidden positions at a time
+  (`_mhc_apply_pre_mix_tile`, `:44`).
+- With `NUM_KSPLIT > 1` it launches `_mhc_fused_split_kernel`, which runs the
+  same loop over one of `NUM_KSPLIT` segments of K and stores partial results
+  (`:476-493`), and then `_mhc_reduce_apply_kernel`, which adds the partial
+  results in segment order (`:674-686`) and computes the RMS factor, the
+  activations and the weighted stream sum.
+- Sinkhorn always runs afterwards in `_mhc_asymmetric_sinkhorn_kernel`, one
+  token per workgroup, with a fixed `num_warps` (`fusions/mhc.py:1044-1060`).
 
-Which parameter acts where:
-
-| Parameter | Acts on |
-|---|---|
-| `NUM_KSPLIT` | number of K segments for the projection and the sum of squares; merge in segment order |
-| `BLOCK_K` | step of the K loop: tile of `tl.dot` and of the sum-of-squares `tl.sum` |
-| `BLOCK_M` | rows per workgroup in every kernel |
-| `BLOCK_C` | C tile of the stream sum (output dimension, not reduced) |
-| `num_warps`, `num_stages`, `waves_per_eu`, `kpack`, `matrix_instr_nonkdim` | Triton launch options of every kernel |
-
-With `config=None`, aiter picks the config per M from
+When no config is passed, aiter chooses one per `M` from
 `configs/gfx942/triton/mhc/mhc_fused_sinkhorn/MHC_FUSED_SINKHORN-C=4096.json`:
 
-| M bucket | NUM_KSPLIT | BLOCK_K | BLOCK_C | BLOCK_M | num_warps |
+| Range of M | NUM_KSPLIT | BLOCK_K | BLOCK_C | BLOCK_M | num_warps |
 |---|---|---|---|---|---|
-| ≤ 256 | 1 | 128 | 128 | 32 | 4 or 8 |
-| ≤ 1024 | 8 | 32 | 128 | 32 | 4 |
-| ≤ 2048 | 8 | 128 | 64 | 64 | 8 |
-| ≤ 4096 | 8 | 256 | 128 | 64 | 4 |
-| ≤ 8192 | 4 | 256 | 256 | 64 | 4 |
-| ≤ 16384, any | 2 | 128 | 128 | 64 | 4 |
+| up to 256 | 1 | 128 | 128 | 32 | 4 or 8 |
+| up to 1024 | 8 | 32 | 128 | 32 | 4 |
+| up to 2048 | 8 | 128 | 64 | 64 | 8 |
+| up to 4096 | 8 | 256 | 128 | 64 | 4 |
+| up to 8192 | 4 | 256 | 256 | 64 | 4 |
+| up to 16384, and above | 2 | 128 | 128 | 64 | 4 |
 
-Every column except `BLOCK_M` changes some reduction order (section 5), so a
-token's bits change at the bucket boundaries.
+Every column except `BLOCK_M` changes the order of some sum (section 5), so a
+token's bits change when `M` crosses a range boundary.
 
 ### 3.2 mHC head
 
-`_mhc_head_dsv4_forward` (`fusions/mhc.py:1188-1242`) launches one kernel,
-`_mhc_head_kernel` (`:108-186`), grid `(cdiv(M, BLOCK_M),)`: the same K loop
-with `tl.dot` and `tl.sum(x*x, axis=1)` (`:142-156`), N padded to
-`N_TILE = 16` for `tl.dot`, then the stream sum over C tiles. Its config comes
-from aiter's tuned `_mhc_head_kernel` entry and does not depend on M; the public
-`config` argument cannot set `num_warps` or `num_stages` (duplicate keyword).
+`_mhc_head_dsv4_forward` (`fusions/mhc.py:1188-1242`) launches a single kernel,
+`_mhc_head_kernel` (`:108-186`). It runs the same loop with `tl.dot` and
+`tl.sum(x * x, axis=1)` (`:142-156`), with the 4 output columns padded to 16
+because `tl.dot` needs at least 16, and then the weighted stream sum. Its
+config comes from aiter's tuned entry for this kernel and does not depend on
+`M`. The public `config` argument cannot set `num_warps` or `num_stages`.
 
 ### 3.3 mHC post
 
-`_mhc_post_kernel` sums the four streams with `tl.static_range(n)` loops
-(`:914-955`), an order written in the kernel; it has no `tl.sum` and its
-config does not depend on M.
+`_mhc_post_kernel` adds the four streams in explicit loops over the stream
+index (`:914-955`). It has no `tl.sum`, and its config does not depend on `M`,
+so it is not part of this problem.
 
-## 4. Why a launch parameter changes the bits
+## 4. Why a launch parameter changes the result bits
 
 ### 4.1 The projection (`tl.dot`)
 
-Triton v3.7.0 (`/home/AMD/zitwang/dev/triton-3.7.0`, commit `5f3f125`)
-replaces `tl.dot` by MFMA instructions in
+Triton v3.7.0 (source at `/home/AMD/zitwang/dev/triton-3.7.0`, commit `5f3f125`)
+replaces `tl.dot` by MFMA matrix instructions in
 `third_party/amd/lib/TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp`. Each MFMA
-has a fixed k (`kDim`), and `tl.dot(x[BLOCK_M, BLOCK_K], fn[BLOCK_K, N], acc)`
-becomes `BLOCK_K / kDim` MFMAs accumulating into the same registers in K
-order; the next loop iteration continues on the same `acc`. So `BLOCK_K` only
-decides where the MFMA sequence is cut into loop iterations.
+instruction multiplies a fixed number of K values. A `tl.dot` over a
+`[BLOCK_M, BLOCK_K]` tile becomes a sequence of such instructions that add into
+the same accumulator in K order, and the next loop iteration continues on the
+same accumulator. `BLOCK_K` therefore only decides where this sequence is cut
+into loop iterations, not the order of the additions.
 
-`kpack` is a compile option of the AMD backend
-(`third_party/amd/backend/compiler.py:56`, passed to
-`add_accelerate_matmul` at `:225`). `AccelerateAMDMatmul.cpp:683-717`:
+`kpack` is a compile option of Triton's AMD backend
+(`third_party/amd/backend/compiler.py:56`, passed to the MFMA pass at `:225`).
+The comment at `AccelerateAMDMatmul.cpp:683-717` explains it: with `kpack = 1`
+each thread loads exactly the K values one MFMA instruction needs; with
+`kpack = 2` it loads twice as many consecutive values and splits them over two
+instructions, so each instruction sums a different set of K values. On gfx950
+and later Triton forces `kpack` back to 1 (`compiler.py:90-94`).
 
-```cpp
-// kWidth: the number of **consecutive** elements each thread loads from shared memory
-// kBase:  the number of elements each thread holds for a single mfma instruction
-// kWidth = kBase,     i.e. kPack = 1: each load from shared memory results in one mfma
-// kWidth = 2 * kBase, i.e. kPack = 2: each load results in two mfma instructions
-auto kWidth = kBase;
-...
-  kWidth *= kPack;
-```
+### 4.2 The sums written as `tl.sum`
 
-With `kpack = 2` a thread's consecutive k elements are shared between two
-MFMAs, so the set of k each MFMA sums changes. Measured (section 5): `kpack=2`
-gives dot operands with `kWidth 8` instead of 4 and changes the bits with an
-exact sum of squares, not with an exact projection. The MFMA instruction shape
-(`matrix_instr_nonkdim=32`: 32x32x8 instead of 16x16x16) does not change the
-bits. Since gfx950, `kpack != 1` is overwritten to 1 (`compiler.py:90-94`).
+Triton turns a `tl.sum` over one axis into three steps
+(`lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp:38-74` in v3.7.0):
 
-### 4.2 `tl.sum`
+1. each thread adds the elements it holds, left to right (`:120-151`);
+2. the lanes that share the axis exchange values with shuffles at distances
+   `lanes/2, lanes/4, …, 1` (`:155-171`);
+3. if the axis is also spread over several warps, the warp results go through
+   shared memory and are added once more (`:56-74`).
 
-**Layout of the operand.** `x_tile` gets the layout of its load, built by the
-coalescing pass (`lib/Dialect/TritonGPU/Transforms/CoalesceUtils.cpp:63-91`):
-elements per thread along the contiguous axis
-`spt = min(alignment, 128 bits / element, BLOCK_M·BLOCK_K / (64·num_warps))`,
-i.e. `min(8, BLOCK_M·BLOCK_K / (64·num_warps))` for bf16. The blocked layout
-builder (`include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:836-850`)
-then gives the contiguous axis `BLOCK_K / spt` lanes (at most 64) and puts the
-remaining lanes and the warps on the rows.
+The order of a row's sum is therefore fixed by the layout of the input along
+the summed axis: elements per thread, lanes and warps. Triton derives that
+layout from the tile shape and `num_warps`. For the sum of squares the input is
+the loaded `x_tile`, whose layout comes from the coalescing pass
+(`lib/Dialect/TritonGPU/Transforms/CoalesceUtils.cpp:63-91`) and the layout
+builder (`include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:836-850`):
 
-**Lowering.** `lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp:38-74`:
+- elements per thread = `min(8, BLOCK_M × BLOCK_K / (64 × num_warps))` for bf16
+  input (8 bf16 values fill one 128-bit load);
+- lanes along K = `BLOCK_K / elements per thread`, at most 64; the remaining
+  lanes and all warps go to the token axis.
 
-1. `reduceWithinThreads` (`:120-151`): each thread adds its `spt` values in register order;
-2. `reduceWithinWarps` → `warpReduce` (`:155-171`): xor shuffles over the lanes
-   on the axis, distances `lanes/2, …, 1`; on gfx942 a full 64-lane reduction
-   uses DPP instead (`third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp:372-452`);
-3. if warps also lie on the axis: partials go through LDS and are reduced again (`:56-74`).
+Consequences, confirmed by the compiled kernels in section 5:
 
-So the tree of one row is fixed by (`spt`, lanes, warps) along the reduced
-axis, and these follow `BLOCK_M`, `BLOCK_K`, `BLOCK_C` and `num_warps`. LLVM
-may also contract a product with the first addition into an FMA, which depends
-on which values meet in the first step (**inferred** from the mHC head
-`BLOCK_C=64` row in section 5, whose stream-sum tree only adds zeros at the
-first level and whose difference appears only with inexact products).
-
-**What follows for aiter's sum of squares** (spt rule above, all confirmed by
-the TTGIR in section 5):
-
-| Kernel, config | spt × lanes | Same tree as the reference? |
+| Kernel and config | Elements per thread × lanes along K | Same order as aiter's config for this kernel? |
 |---|---|---|
-| pre, `BLOCK_M=32, BLOCK_K=128, num_warps=4` (reference) | 8 × 16 | — |
-| pre, `BLOCK_M` 16–128 with `num_warps` 1–4, or 64 with 8 | 8 × 16 | yes |
-| pre, `BLOCK_M=16, num_warps=8` | 4 × 32 | no |
-| head, `BLOCK_M=16, BLOCK_K=64, num_warps=4` (aiter's) | 4 × 16 | — |
-| head, `BLOCK_M=32` or `num_warps=2` | 8 × 8 | no |
-| head, `num_warps=8` | 2 × 32 | no |
-| head, `BLOCK_M=32, num_warps=8` | 4 × 16 | yes |
+| mHC pre, `BLOCK_M = 32, BLOCK_K = 128, num_warps = 4` | 8 × 16 | (reference) |
+| mHC pre, `BLOCK_M` from 16 to 128 with `num_warps` 1 to 4, or `BLOCK_M = 64` with `num_warps = 8` | 8 × 16 | yes |
+| mHC pre, `BLOCK_M = 16, num_warps = 8` | 4 × 32 | no |
+| mHC head, `BLOCK_M = 16, BLOCK_K = 64, num_warps = 4` (aiter's) | 4 × 16 | (reference) |
+| mHC head, `BLOCK_M = 32`, or `num_warps = 2` | 8 × 8 | no |
+| mHC head, `num_warps = 8` | 2 × 32 | no |
+| mHC head, `BLOCK_M = 32, num_warps = 8` | 4 × 16 | yes |
 
-For mhc_pre with `BLOCK_K=128` the element count per thread reaches the cap of
-8 for almost every config, which is why `BLOCK_M` and `num_warps` look free;
-for mhc_head with `BLOCK_K=64` it is 4, below the cap, so they are not.
+This is why `BLOCK_M` and `num_warps` look free for mHC pre: with
+`BLOCK_K = 128` the number of elements per thread almost always reaches its cap
+of 8. For mHC head, with `BLOCK_K = 64`, it is 4, below the cap, so they are not
+free.
 
-## 5. Measured attribution and layouts
+The weighted stream sum works the same way, over the 4 stream values of a
+`[BLOCK_M, 4, BLOCK_C]` tile (16 in mHC head because of the padding). Larger
+`BLOCK_C` leaves fewer lanes for the stream axis and changes its order.
 
-Job 68321538, MI325X, Triton 3.7.0 (image), aiter `326cffa`,
-`benchmarks/operators/mhc/analyze_aiter_reductions.py`. Each config changes
-the listed parameters of a class reference and runs on four inputs at M = 17
-and 1024:
+Not verified: in mHC head with `BLOCK_C = 64`, the stream-sum layout changes but
+the first step of the new order only adds padding zeros; the bits change only
+when the products `weight × x` round. A possible reason is that the compiler
+fuses a product with the first addition into one FMA instruction in one layout
+and not in the other.
 
-- `random`: both long reductions round;
-- `exact sum of squares`: residual in {−2, −1, 1, 2}, every Σx² is an integer
-  below 2^24 and exact in any order — a difference comes from the projection
-  or the stream sum;
-- `exact projection`: one 1 per fn row, the projection is one input element —
-  a difference comes from the sum of squares or the stream sum;
-- `both exact`: the mixing weights are then equal for every config — a
-  difference comes from the stream sum.
+### 4.3 Triton version
 
-The layout columns come from the TTGIR of the launched kernels: for the
-operand of each `tt.reduce`, the length of the reduced axis and its elements
-per thread (spt), lanes and warps; for the dot, the MFMA shape and `kWidth`.
-Cells: `same` or the outputs that differ (count at M = 17 / 1024).
+Triton v3.8.0 rewrote the first step. Instead of adding a thread's own
+elements left to right, it adds them as a binary tree (`treeReduce`,
+`ReduceOpToLLVM.cpp:116-142` and `:286-303` at tag `v3.8.0`; the tree has two
+inputs per node for additions, `third_party/amd/lib/TritonAMDGPUToLLVM/TargetInfo.cpp:689-697`).
+With 4 or 8 elements per thread the two orders differ, so the same kernel and
+the same launch config give other bits under Triton 3.8.0 (section 7.4).
 
-### 5.1 mhc_pre, NUM_KSPLIT=1 (_mhc_fused_kernel)
+## 5. Measurements that confirm it
 
-Reference: `{'NUM_KSPLIT': 1, 'BLOCK_M': 32, 'BLOCK_K': 128, 'BLOCK_C': 128, 'num_warps': 4, 'num_stages': 1, 'waves_per_eu': 2}`
+Job 68321538, MI325X, Triton 3.7.0 from the container image, aiter `326cffa`,
+script `benchmarks/operators/mhc/analyze_aiter_reductions.py`. Full tables:
+`/home/AMD/zitwang/dev/logs/mhc-bi-analysis-68321538-triton-image.md`.
 
-| config | random | exact sum of squares | exact projection | both exact |
+Each launch config differs from a reference config in the listed parameters.
+Both run at `M = 17` and `M = 1024` on four kinds of input, chosen so that a
+difference can only come from certain sums:
+
+- random input: every sum rounds;
+- "exact sum of squares": residual values in {−2, −1, 1, 2}, so every sum of
+  squares is an integer below 2^24 and exact in any order; a difference must
+  come from the projection or the stream sum;
+- "exact projection": each weight row has a single 1, so each projection is a
+  single input value; a difference must come from the sum of squares or the
+  stream sum;
+- "both exact": the mixing weights are then equal for every config; a
+  difference must come from the stream sum.
+
+The script also reads the compiled Triton IR of every kernel and reports, for
+the input of each `tl.sum`, the elements per thread, lanes and warps along the
+summed axis, and the `kWidth` (consecutive K values per thread) of the dot
+inputs.
+
+| Kernel | Parameters changed from the reference | Bits changed for input kind | Sum whose layout changed | Conclusion |
 |---|---|---|---|---|
-| reference | reference | reference | reference | reference |
-| BLOCK_M=16 | same | same | same | same |
-| BLOCK_M=64 | same | same | same | same |
-| BLOCK_M=128 | same | same | same | same |
-| num_warps=1 | same | same | same | same |
-| num_warps=2 | same | same | same | same |
-| num_warps=8 | same | same | same | same |
-| BLOCK_M=16 num_warps=2 | same | same | same | same |
-| BLOCK_M=16 num_warps=8 | differs: post_mix (2 at M=17, 159 at M=1024); comb_mix (32 at M=17, 1267 at M=1024); layer_input (1 at M=17, 26 at M=1024) | same | differs: post_mix (5 at M=17, 162 at M=1024); comb_mix (33 at M=17, 1257 at M=1024); layer_input (1 at M=17, 17 at M=1024) | same |
-| BLOCK_M=64 num_warps=8 | same | same | same | same |
-| num_stages=2 | same | same | same | same |
-| BLOCK_K=32 | differs: post_mix (17 at M=17, 1456 at M=1024); comb_mix (108 at M=17, 8912 at M=1024); layer_input (4 at M=17, 246 at M=1024) | same | differs: post_mix (19 at M=17, 1418 at M=1024); comb_mix (112 at M=17, 8901 at M=1024); layer_input (4 at M=17, 230 at M=1024) | same |
-| BLOCK_K=64 | differs: post_mix (18 at M=17, 1231 at M=1024); comb_mix (160 at M=17, 8143 at M=1024); layer_input (3 at M=17, 194 at M=1024) | same | differs: post_mix (20 at M=17, 1239 at M=1024); comb_mix (147 at M=17, 8059 at M=1024); layer_input (7 at M=17, 194 at M=1024) | same |
-| BLOCK_K=256 | differs: post_mix (12 at M=17, 920 at M=1024); comb_mix (141 at M=17, 6627 at M=1024); layer_input (4 at M=17, 129 at M=1024) | same | differs: post_mix (18 at M=17, 949 at M=1024); comb_mix (146 at M=17, 6655 at M=1024); layer_input (3 at M=17, 144 at M=1024) | same |
-| BLOCK_C=64 | same | same | same | same |
-| BLOCK_C=256 | differs: layer_input (1 at M=17, 140 at M=1024) | differs: layer_input (103 at M=1024) | differs: layer_input (3 at M=17, 148 at M=1024) | differs: layer_input (47 at M=17, 166 at M=1024) |
-| kpack=2 | differs: post_mix (58 at M=17, 3505 at M=1024); comb_mix (252 at M=17, 15440 at M=1024); layer_input (27 at M=17, 1444 at M=1024) | differs: post_mix (2 at M=17, 190 at M=1024); comb_mix (146 at M=17, 8217 at M=1024) | same | same |
-| matrix_instr_nonkdim=32 | same | same | same | same |
+| mHC pre, no K split | `BLOCK_M` 16/64/128; `num_warps` 1/2/8; `BLOCK_M = 16` with `num_warps = 2`; `BLOCK_M = 64` with `num_warps = 8`; `num_stages = 2`; `BLOCK_C = 64` | none | none | free |
+| mHC pre, no K split | `BLOCK_M = 16` with `num_warps = 8` | random, exact projection | sum of squares: 8 × 16 → 4 × 32 | sum of squares |
+| mHC pre, no K split | `BLOCK_K` 32/64/256 | random, exact projection | sum of squares | sum of squares |
+| mHC pre, no K split | `BLOCK_C = 256` | all four, only `layer_input` | stream sum: 4 lanes → 2 lanes × 2 warps | stream sum |
+| mHC pre, no K split | `kpack = 2` | random, exact sum of squares | dot input `kWidth` 4 → 8 | projection |
+| mHC pre, no K split | `matrix_instr_nonkdim = 32` | none | MFMA 16×16×16 → 32×32×8 only | free |
+| mHC pre, 4 K segments | the other 7 entries of RL-Kernel's table (various `BLOCK_M`, `BLOCK_C ≤ 128`, `num_warps` 2/4, `num_stages`, `waves_per_eu`) | none | none (some select MFMA 32×32×8) | free |
+| mHC pre, 4 K segments | `num_warps = 8` with `BLOCK_M = 16` | random, exact projection | sum of squares: 8 × 16 → 4 × 32 | sum of squares |
+| mHC pre, 4 K segments | `BLOCK_C = 256`; `BLOCK_K = 64`; `kpack = 2` | as in the rows above | as above | as above |
+| mHC head | `BLOCK_M = 32`; `num_warps` 2 or 8 | random, exact projection | sum of squares: 4 × 16 → 8 × 8 or 2 × 32 | sum of squares |
+| mHC head | `BLOCK_M = 32` with `num_warps = 8` | none | none (4 × 16 again) | free |
+| mHC head | `num_stages = 2`; `waves_per_eu = 2` | none | none | free |
+| mHC head | `BLOCK_K` 32/128 | random, exact projection | sum of squares | sum of squares |
+| mHC head | `BLOCK_C` 64/256 | random, exact projection (256: all four) | stream sum | stream sum |
+| mHC head | `kpack = 2` | random, exact sum of squares | dot input `kWidth` 4 → 8 | projection |
 
-| config | sum of squares | stream sum | dot operands |
-|---|---|---|---|
-| reference | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=16 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=64 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=128 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| num_warps=1 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| num_warps=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| num_warps=8 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=16 num_warps=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=16 num_warps=8 | len 128: spt 4, lanes 32, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=64 num_warps=8 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| num_stages=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_K=32 | len 32: spt 4, lanes 8, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_K=64 | len 64: spt 8, lanes 8, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_K=256 | len 256: spt 8, lanes 32, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_C=64 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_C=256 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 2, warps 2 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| kpack=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 8; op1 kWidth 8 |
-| matrix_instr_nonkdim=32 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 32, 32, 8; op0 kWidth 4; op1 kWidth 4 |
+In every one of the 39 configs, the bits changed exactly when one of these
+layouts changed. Compiling the same configs with Triton 3.8.0
+(`3.8.0+amd.rocm7.2.0.git7cb7b059`, the version aiter pins) gives the same
+layouts in every row (same job, `--layouts-only`).
 
-### 5.2 mhc_pre, NUM_KSPLIT=4 (_mhc_fused_split_kernel + _mhc_reduce_apply_kernel)
+## 6. How other implementations handle it
 
-Reference: `{'NUM_KSPLIT': 4, 'BLOCK_M': 16, 'BLOCK_K': 128, 'BLOCK_C': 64, 'num_warps': 4, 'num_stages': 1, 'waves_per_eu': 0}`
-
-| config | random | exact sum of squares | exact projection | both exact |
-|---|---|---|---|---|
-| reference | reference | reference | reference | reference |
-| BLOCK_M=64 num_stages=2 waves_per_eu=1 | same | same | same | same |
-| BLOCK_M=64 BLOCK_C=128 num_warps=2 num_stages=2 waves_per_eu=1 | same | same | same | same |
-| num_warps=2 waves_per_eu=2 | same | same | same | same |
-| BLOCK_C=128 num_warps=2 waves_per_eu=2 | same | same | same | same |
-| BLOCK_M=128 num_stages=2 | same | same | same | same |
-| BLOCK_M=64 num_warps=2 | same | same | same | same |
-| BLOCK_M=128 waves_per_eu=2 | same | same | same | same |
-| num_warps=8 | differs: post_mix (1 at M=17, 107 at M=1024); comb_mix (9 at M=17, 764 at M=1024); layer_input (16 at M=1024) | same | differs: post_mix (90 at M=1024); comb_mix (14 at M=17, 766 at M=1024); layer_input (17 at M=1024) | same |
-| BLOCK_C=256 | differs: layer_input (4 at M=17, 151 at M=1024) | differs: layer_input (64 at M=1024) | differs: layer_input (4 at M=17, 143 at M=1024) | differs: layer_input (47 at M=17, 166 at M=1024) |
-| BLOCK_K=64 | differs: post_mix (9 at M=17, 374 at M=1024); comb_mix (70 at M=17, 2747 at M=1024); layer_input (1 at M=17, 58 at M=1024) | same | differs: post_mix (8 at M=17, 364 at M=1024); comb_mix (65 at M=17, 2756 at M=1024); layer_input (2 at M=17, 58 at M=1024) | same |
-| kpack=2 | differs: post_mix (45 at M=17, 3120 at M=1024); comb_mix (244 at M=17, 14633 at M=1024); layer_input (8 at M=17, 885 at M=1024) | differs: post_mix (2 at M=17, 114 at M=1024); comb_mix (104 at M=17, 5731 at M=1024); layer_input (94 at M=1024) | same | same |
-
-| config | sum of squares | stream sum | dot operands |
-|---|---|---|---|
-| reference | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=64 num_stages=2 waves_per_eu=1 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 32, 32, 8; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=64 BLOCK_C=128 num_warps=2 num_stages=2 waves_per_eu=1 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 32, 32, 8; op0 kWidth 4; op1 kWidth 4 |
-| num_warps=2 waves_per_eu=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_C=128 num_warps=2 waves_per_eu=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=128 num_stages=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 32, 32, 8; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=64 num_warps=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 32, 32, 8; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=128 waves_per_eu=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 32, 32, 8; op0 kWidth 4; op1 kWidth 4 |
-| num_warps=8 | len 128: spt 4, lanes 32, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_C=256 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 2, warps 2 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_K=64 | len 64: spt 4, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| kpack=2 | len 128: spt 8, lanes 16, warps 1 | len 4: spt 1, lanes 4, warps 1 | mfma 16, 16, 16; op0 kWidth 8; op1 kWidth 8 |
-
-### 5.3 mhc_head (_mhc_head_kernel)
-
-Reference: `{'BLOCK_M': 16, 'BLOCK_K': 64, 'BLOCK_C': 128, 'num_warps': 4, 'num_stages': 1}`
-
-| config | random | exact sum of squares | exact projection | both exact |
-|---|---|---|---|---|
-| reference | reference | reference | reference | reference |
-| BLOCK_M=32 | differs: output (2 at M=17, 31 at M=1024) | same | differs: output (26 at M=1024) | same |
-| num_warps=2 | differs: output (3 at M=17, 131 at M=1024) | same | differs: output (1 at M=17, 131 at M=1024) | same |
-| num_warps=8 | differs: output (1 at M=17, 23 at M=1024) | same | differs: output (1 at M=17, 27 at M=1024) | same |
-| BLOCK_M=32 num_warps=8 | same | same | same | same |
-| num_stages=2 | same | same | same | same |
-| waves_per_eu=2 | same | same | same | same |
-| BLOCK_K=32 | differs: output (4 at M=17, 265 at M=1024) | same | differs: output (5 at M=17, 272 at M=1024) | same |
-| BLOCK_K=128 | differs: output (5 at M=17, 200 at M=1024) | same | differs: output (3 at M=17, 212 at M=1024) | same |
-| BLOCK_C=64 | differs: output (1 at M=17, 104 at M=1024) | same | differs: output (1 at M=17, 113 at M=1024) | same |
-| BLOCK_C=256 | differs: output (1 at M=17, 154 at M=1024) | differs: output (125 at M=1024) | differs: output (3 at M=17, 156 at M=1024) | differs: output (184 at M=1024) |
-| kpack=2 | differs: output (21 at M=17, 1456 at M=1024) | differs: output (61 at M=1024) | same | same |
-
-| config | sum of squares | stream sum | dot operands |
-|---|---|---|---|
-| reference | len 64: spt 4, lanes 16, warps 1 | len 16: spt 1, lanes 4, warps 4 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=32 | len 64: spt 8, lanes 8, warps 1 | len 16: spt 1, lanes 4, warps 4 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| num_warps=2 | len 64: spt 8, lanes 8, warps 1 | len 16: spt 1, lanes 4, warps 2 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| num_warps=8 | len 64: spt 2, lanes 32, warps 1 | len 16: spt 1, lanes 4, warps 4 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_M=32 num_warps=8 | len 64: spt 4, lanes 16, warps 1 | len 16: spt 1, lanes 4, warps 4 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| num_stages=2 | len 64: spt 4, lanes 16, warps 1 | len 16: spt 1, lanes 4, warps 4 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| waves_per_eu=2 | len 64: spt 4, lanes 16, warps 1 | len 16: spt 1, lanes 4, warps 4 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_K=32 | len 32: spt 2, lanes 16, warps 1 | len 16: spt 1, lanes 4, warps 4 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_K=128 | len 128: spt 8, lanes 16, warps 1 | len 16: spt 1, lanes 4, warps 4 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_C=64 | len 64: spt 4, lanes 16, warps 1 | len 16: spt 1, lanes 8, warps 2 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| BLOCK_C=256 | len 64: spt 4, lanes 16, warps 1 | len 16: spt 1, lanes 2, warps 4 | mfma 16, 16, 16; op0 kWidth 4; op1 kWidth 4 |
-| kpack=2 | len 64: spt 4, lanes 16, warps 1 | len 16: spt 1, lanes 4, warps 4 | mfma 16, 16, 16; op0 kWidth 8; op1 kWidth 8 |
-
-
-### 5.4 Reading
-
-In all 39 configs, the bits differ from the reference exactly
-when one of the three layouts differs: the sum-of-squares layout (spt × lanes),
-the stream-sum layout, or the dot `kWidth`. The MFMA shape alone
-(`matrix_instr_nonkdim=32`, or `BLOCK_M ≥ 64` in the split path, which selects
-32x32x8) never changes them. The exact inputs place each difference:
-`BLOCK_K`, `BLOCK_M=16 + num_warps=8` and head `BLOCK_M`/`num_warps` act through
-the sum of squares; `kpack` through the projection; `BLOCK_C` through the stream
-sum.
-
-### 5.5 Triton 3.8.0
-
-The same configs compiled with Triton 3.8.0 (`3.8.0+amd.rocm7.2.0.git7cb7b059`,
-the version aiter pins) give identical layouts (spt, lanes, warps, `kWidth`) in
-every row (same job, `--layouts-only`). The bits still change between the two
-versions; see 7.5.
-
-## 6. Reference implementations
-
-Sources fetched to `/home/AMD/zitwang/dev/refs/` at the commits linked from the
-RFC (task 1, 8 and 9 rows). For each: where the sum of squares and the
-projection are computed, what fixes their order, and whether anything depends
-on M.
+The code below was fetched at the commits the RFC links to (tasks 1, 8 and 9)
+and read; it was not run, except aiter's HIP kernels in 6.5.
 
 ### 6.1 DeepSeek-V4 official reference
 
 Hugging Face `deepseek-ai/DeepSeek-V4-Flash`, revision `60d8d70`,
 `inference/model.py`.
 
-- `hc_pre` (`:676-680`) and `hc_head` (`:730-734`) are PyTorch eager:
-  `x.square().mean(-1)` and `F.linear(x, hc_fn)` in fp32 with fp32 `hc_fn`;
-  the stream sum is `torch.sum(..., dim=2)`.
-- The only mHC kernel in `inference/kernel.py` is `hc_split_sinkhorn`
-  (`:372-427`, TileLang, one block of 64 threads per row, `T.reduce_sum` on a
-  4×4 fragment; the launch shape does not depend on M).
-- The reduction orders are those of PyTorch's reduction and cuBLAS SGEMM, which
-  choose their algorithm from the shape; the reference does not claim batch
-  invariance.
+- `hc_pre` (`:676-680`) and `hc_head` (`:730-734`) are plain PyTorch:
+  `x.square().mean(-1)` and `F.linear(x, hc_fn)` in fp32 with fp32 weights; the
+  stream sum is `torch.sum(..., dim=2)`.
+- The only mHC kernel in `inference/kernel.py` is the Sinkhorn kernel
+  `hc_split_sinkhorn` (`:372-427`, TileLang, one block of 64 threads per token).
+- The order of the sums is whatever PyTorch's reduction and cuBLAS choose for
+  the tensor shape. The reference does not aim for batch invariance.
 
 ### 6.2 DeepGEMM `tf32_hc_prenorm_gemm`
 
-`ISEEKYAN/DeepGEMM` `dfad223`; used by vLLM and mLite on NVIDIA.
+`ISEEKYAN/DeepGEMM` commit `dfad223`; used by vLLM and SGLang on NVIDIA.
 
-- Fused: one kernel computes the projection (TF32 MMA, fp32 `fn`) and Σx² in
-  the same K loop.
-- Sum of squares written by hand (`deep_gemm/include/deep_gemm/impls/sm90_tf32_hc_prenorm_gemm.cuh:163-234`):
+- One kernel computes the projection (TF32 matrix instructions, fp32 weights)
+  and the sum of squares in the same loop over K.
+- The sum of squares is written by hand
+  (`deep_gemm/include/deep_gemm/impls/sm90_tf32_hc_prenorm_gemm.cuh:163-234`).
+  Every thread owns fixed columns, adds their squares over all K blocks, and a
+  fixed 4-lane shuffle combines the threads of a row:
 
   ```cpp
-  uint32_t row = warp_idx * 16 + lane_idx / 4;           // fixed row-to-lane map
+  uint32_t row = warp_idx * 16 + lane_idx / 4;           // fixed row of each thread
   ...
   sqr_sum_acc_0 += a_float2_0.x * a_float2_0.x + a_float2_1.x * a_float2_1.x;
   ...
-  const auto& reduced_sum_0 = math::warp_reduce_sum<4>(sqr_sum_acc_0);  // 4-lane shuffle
+  const auto& reduced_sum_0 = math::warp_reduce_sum<4>(sqr_sum_acc_0);
   ```
 
-  Each thread accumulates its fixed columns over all K blocks, then a fixed
-  4-lane butterfly. sm100 (`__ffma2_rn`) and sm120 are the same pattern.
-- Every tile constant is fixed (`csrc/jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp:72-82`):
-  `block_m = 64`, `block_k = 64`, 128 math threads, `block_n = align(n, 16)`.
-  The pipeline depth depends only on n. M only sets the grid.
-- `num_splits` is an API argument (`csrc/apis/hyperconnection.hpp:18-57`,
-  default 1); partials go to `[num_splits, M, N]` and are not merged by the
-  kernel.
-- Batch invariant by construction if the caller fixes `num_splits`.
+  The sm100 and sm120 versions follow the same pattern.
+- Every tile size is a constant
+  (`csrc/jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp:72-82`): 64 tokens and
+  64 K values per tile, 128 math threads. `M` only sets the number of
+  workgroups.
+- The number of K segments is an argument of the API
+  (`csrc/apis/hyperconnection.hpp:18-57`, default 1); the kernel stores one
+  partial result per segment and leaves the addition to the caller.
+- The result is batch invariant as long as the caller passes the same number
+  of segments for every `M`.
 
-### 6.3 vLLM mHC on NVIDIA, and PR #59929
+### 6.3 vLLM on NVIDIA, and vLLM PR #59929
 
-`inaniloquentee/vllm` `e1107b01` (PR [#59929](https://github.com/vllm-project/vllm/pull/59929)),
-original `ISEEKYAN/vllm` `4b5c627`, `vllm/model_executor/kernels/mhc/`.
+`inaniloquentee/vllm` commit `e1107b01` (PR [#59929](https://github.com/vllm-project/vllm/pull/59929))
+and the earlier `ISEEKYAN/vllm` commit `4b5c627`, directory
+`vllm/model_executor/kernels/mhc/`.
 
-- `_hc_prenorm_gemm_outputs` (`tilelang.py:25-75`) calls DeepGEMM when
-  available. The split count is `compute_num_split(64, K, cdiv(split_tokens, 64))`
-  with `split_tokens = 1 if envs.VLLM_BATCH_INVARIANT else num_tokens` (`:42-44`),
-  i.e. `min(SM count // 1, K/64 // 4)` in batch-invariant mode
-  (`tilelang_kernels.py:45-54`): fixed per GPU and K.
-- Partials are merged by `for i_split in T.serial(n_splits): rms[0] += …` in
-  the TileLang big-fuse kernel (split order).
-- What #59929 changed: it restored `split_tokens = 1` in the two helpers where
-  a refactor had lost it, and in batch-invariant mode disables the fused
-  post+pre kernel (`models/deepseek_v4/nvidia/model.py`, `use_fused_mhc = not
-  VLLM_BATCH_INVARIANT`), whose small-M path computes Σx² on the fp32 residual
-  instead of the bf16 one. No kernel changed.
+- `_hc_prenorm_gemm_outputs` (`tilelang.py:25-75`) calls DeepGEMM when it is
+  available. The number of K segments is
+  `compute_num_split(64, K, cdiv(split_tokens, 64))` with
+  `split_tokens = 1 if envs.VLLM_BATCH_INVARIANT else num_tokens` (`:42-44`). In
+  batch-invariant mode it is therefore `min(number of SMs, K / 256)`
+  (`tilelang_kernels.py:45-54`): fixed for a given GPU and K.
+- The partial results are added in segment order by a serial loop in the
+  TileLang kernel that follows.
+- PR #59929 changed no kernel. It restored `split_tokens = 1` in two helpers
+  where a refactor had dropped it, and in batch-invariant mode it turns off the
+  fused post-and-pre kernel (`models/deepseek_v4/nvidia/model.py:1265`,
+  `use_fused_mhc = not envs.VLLM_BATCH_INVARIANT`), whose small-`M` path squares
+  the fp32 residual instead of the bf16 one.
 
-### 6.4 vLLM TileLang fallback (no DeepGEMM)
+### 6.4 vLLM's TileLang kernel for GPUs without DeepGEMM
 
-Same files. `hc_prenorm_gemm_tilelang` (`tilelang_kernels.py:879-919`) writes
-its tree by hand (per-thread serial sum, `T.warp_reduce_sum`, then a serial
-sum over warps), but its compile key picks the thread count from M
-(`tilelang_kernels.py:1147-1163`):
+Same files. `hc_prenorm_gemm_tilelang` (`tilelang_kernels.py:879-919`) also
+writes its order by hand: each thread adds its K values serially, then
+`T.warp_reduce_sum`, then a serial loop over the warps. But it chooses its
+thread count from `M` (`tilelang_kernels.py:1147-1163`):
 
 ```python
 use_block_m = use_default_config and num_tokens >= 1024
 use_small_tile = (use_default_config and not use_block_m
                   and num_tokens < 128 and hc_hidden_size % 1024 == 0)
-effective_n_thr = 1024 if use_small_tile else n_thr     # 512 otherwise
+effective_n_thr = 1024 if use_small_tile else n_thr     # n_thr is 512 by default
 ```
 
-Each thread owns K elements `tid, tid + n_thr, …`, so changing `n_thr`
-changes a row's order between M < 128 and M ≥ 128. Not gated by
-`VLLM_BATCH_INVARIANT`. The batch-invariance test of #59929 runs the DeepGEMM
-path only.
+Thread `t` owns K values `t, t + n_thr, …`, so the order changes between
+`M < 128` and `M ≥ 128`. Batch-invariant mode does not change this, and the
+test added by #59929 only covers the DeepGEMM path.
 
-### 6.5 vLLM DeepSeek-V4 on ROCm: aiter's HIP `mhc_pre`
+### 6.5 vLLM on ROCm: aiter's HIP mHC pre
 
-`vllm/models/deepseek_v4/amd/model.py` uses `MHCPreOp` →
-`vllm/_aiter_ops.py:4111` `rocm_aiter_ops.mhc_pre` → `aiter.ops.mhc.mhc_pre`
-(aiter's HIP kernels, not the Triton ones above). The AMD model file has no
-batch-invariant gate.
+`vllm/models/deepseek_v4/amd/model.py` uses `MHCPreOp`, which calls
+`rocm_aiter_ops.mhc_pre` (`vllm/_aiter_ops.py:4111`) and through it
+`aiter.ops.mhc.mhc_pre`, aiter's HIP kernels (not the Triton ones of section 3).
+mHC head runs through the same function with the weights padded to 24 rows and
+Sinkhorn turned off (`vllm/_aiter_ops.py:4433-4480`). The ROCm model file has no
+batch-invariant switch.
 
-- `aiter/ops/mhc.py:610-700` picks `(split_k, tile_k)` with
-  `get_mhc_pre_splitk(m, hc_hidden_size)` (`:292-332`), a score over
-  `num_tg_m = ceil(m / 64)` and the CU count: the split depends on M.
-- `mhc_pre_gemm_sqrsum` (`csrc/kernels/mhc_kernels.cu:880-975`) also picks
-  `tile_n` 16 or 32 from `m_blocks · split_k` vs the CU count.
-- Within one launch the sum of squares is per-lane accumulation plus
-  `cross_row_sum_4` (`:133-147`, two fixed `ds_bpermute` steps), and
-  `mhc_pre_big_fuse` merges the splits with a wave reduce (`:1060-1140`).
-- The projection can run in fp32 through a bf16 hi/lo split of `fn`
-  (`mhc_shuffle_fn`, `aiter/ops/mhc.py:44-70`).
+- `mhc_pre` (`aiter/ops/mhc.py:610-700`) chooses the number of K segments and
+  the K tile with `get_mhc_pre_splitk(m, hc_hidden_size)` (`:292-332`), from the
+  number of token tiles and the number of compute units, so the choice depends
+  on `M`.
+- Inside, `mhc_pre_gemm_sqrsum` (`csrc/kernels/mhc_kernels.cu:880-975`) also
+  chooses a tile width of 16 or 32 outputs from the number of workgroups, and
+  `mhc_pre_big_fuse` chooses its block size from `m <= cu_num * 12`
+  (`:1387-1392`).
+- Within one launch, each lane adds its own squares and a fixed two-step
+  exchange combines the lanes (`cross_row_sum_4`, `:133-147`); the K segments
+  are added with a wavefront reduction (`:1060-1140`).
+- The projection uses the fp32 weights by default; an optional mode splits each
+  weight into two bf16 parts (`mhc_shuffle_fn`, `aiter/ops/mhc.py:44-70`).
 
-Measured (job 68322040, `benchmarks/operators/mhc/probe_aiter_hip_mhc_pre.py`,
-aiter `326cffa` HIP module built from a copy of the checkout with CK headers at
-its submodule commit `af9e1d1`):
+Measured on MI325X (job 68322040, `benchmarks/operators/mhc/probe_aiter_hip_mhc_pre.py`):
 
-| M | 1–256 | 1024 | 2048 | 4096 | 8192 | 16384 |
+| M | 1 to 256 | 1024 | 2048 | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|---|
-| `get_mhc_pre_splitk` (split_k, tile_k) on MI325X | (64, 128) | (32, 128) | (16, 128) | (8, 128) | (4, 128) | (2, 128) |
+| K segments and K tile chosen by `get_mhc_pre_splitk` | 64, 128 | 32, 128 | 16, 128 | 8, 128 | 4, 128 | 2, 128 |
 
-`mhc_pre` as vLLM calls it changes a token's bits from M = 1024 on, for pre and
-for head (section 7.3, row "E aiter split").
+With this choice, a token's bits change from `M = 1024` on, for mHC pre and for
+mHC head (section 7.2).
 
-### 6.6 vLLM batch-invariant RMSNorm and matmul
+### 6.6 vLLM's batch-invariant RMSNorm and matmul
 
-`inaniloquentee/vllm` `76aacf3`, `vllm/model_executor/determinism/batch_invariant.py`;
-PR [#59952](https://github.com/vllm-project/vllm/pull/59952).
+`inaniloquentee/vllm` commit `76aacf3`,
+`vllm/model_executor/determinism/batch_invariant.py`; PR
+[#59952](https://github.com/vllm-project/vllm/pull/59952).
 
-- RMSNorm (`:1132-1181`, launch `:1225-1241`): one workgroup per row, a loop
-  over chunks of `BLOCK_SIZE = 1024`, `tl.sum` per chunk, chunks added in
-  order; `num_warps` left at Triton's default. The order inside a chunk is
-  `tl.sum`'s tree for that fixed layout: invariance comes from never changing
-  the constexprs, the same mechanism as candidate A.
-- The CUDA `fused_add_rms_norm` launcher locks its block size to
+- RMSNorm (`:1132-1181`, launched at `:1225-1241`): one workgroup per token,
+  a loop over chunks of 1024 values, one `tl.sum` per chunk, chunks added in
+  order, `num_warps` left at Triton's default. The order inside a chunk is the
+  `tl.sum` order for that fixed layout; it stays fixed because the constants
+  never change, the same mechanism as `aiter_config_table`.
+- The CUDA `fused_add_rms_norm` launcher fixes its block size to
   `min(hidden, 1024)` in batch-invariant mode
   (`csrc/libtorch_stable/layernorm_kernels.cu:329-372`).
 - Matmul (`:46-54`): "What is summed is a function of (K, N, dtype) only --
-  never of M". `BLOCK_SIZE_K` fixed per dtype (32 fp32, 64 otherwise);
-  `_split_k_plan(K, N)` (`:66-83`): one chunk if N > 64 or K < 1024, else
-  `clamp(K // 512, 1, 16)` chunks aligned to 64, merged in ascending order.
-  `BLOCK_M`, `BLOCK_N` and `num_warps` follow M ("Tiles only regroup rows and
-  columns"). On ROCm this matmul replaces hipBLASLt ("Neither cuBLASLt on SM80
-  (Ampere) nor hipBLASLt can be made batch invariant", PR head `3fd5277`,
-  `batch_invariant.py:1534`) and sets `VLLM_ROCM_USE_SKINNY_GEMM=0` (`:1613`).
-- PR [#59925](https://github.com/vllm-project/vllm/pull/59925) concerns the
+  never of M". The K tile is fixed per dtype (32 for fp32, 64 otherwise);
+  `_split_k_plan(K, N)` (`:66-83`) uses one K segment when N > 64 or K < 1024,
+  otherwise `K // 512` segments (at most 16), added in order. `BLOCK_M`,
+  `BLOCK_N` and `num_warps` follow `M`. On ROCm this matmul replaces hipBLASLt
+  ("Neither cuBLASLt on SM80 (Ampere) nor hipBLASLt can be made batch
+  invariant", PR head `3fd5277`, `batch_invariant.py:1534`) and
+  `VLLM_ROCM_USE_SKINNY_GEMM` is set to 0 (`:1613`).
+- PR [#59925](https://github.com/vllm-project/vllm/pull/59925) is about the
   DeepSeek-V4 MoE path, not GEMM or RMSNorm.
 
 ### 6.7 Megatron PR #7050 and mLite
 
-`ISEEKYAN/Megatron-LM` `327a238` (PR [#7050](https://github.com/NVIDIA/Megatron-LM/pull/7050)
-head is the same commit), `experimental/lite/megatron/lite/model/deepseek_v4/vllm/primitive/dense.py`.
+`ISEEKYAN/Megatron-LM` commit `327a238`, which is also the head of PR
+[#7050](https://github.com/NVIDIA/Megatron-LM/pull/7050),
+`experimental/lite/megatron/lite/model/deepseek_v4/vllm/primitive/dense.py`.
 
-- Forward: `_MHC_ENTRIES` (`:24-30`) maps pre, post, post_pre and head to vLLM's
-  TileLang/DeepGEMM functions (6.3); batch-invariant mode is vLLM's
-  `VLLM_BATCH_INVARIANT=1`.
-- Backward (`:512-845`): recomputed in PyTorch (`torch.compile`, eager fallback);
-  the pre backward recomputes the norm as `1/(norm/sqrt(K)+eps)` in bf16 and
-  reduces dW and dbias over tokens with matmul and `.sum()`. Not batch
-  invariant; mLite does not claim it is.
+- The forward pass calls vLLM's functions (`_MHC_ENTRIES`, `:24-30`), so it
+  behaves as in 6.3 when `VLLM_BATCH_INVARIANT=1`.
+- The backward pass (`:512-845`) recomputes in PyTorch: the pre backward
+  recomputes the norm as `1 / (norm / sqrt(K) + eps)` in bf16, and the weight
+  and bias gradients are matmuls and sums over the tokens. It is not batch
+  invariant, and mLite does not claim it is.
 
 ### 6.8 SGLang
 
-`sgl-project/sglang` main `4003bf1` (2026-11-08), read only, not run.
-`python/sglang/srt/models/deepseek_v4_mhc.py` `_mix_stats_impl` (`:361-468`)
-picks the mix-stats path:
+`sgl-project/sglang` main, commit `4003bf1` (2026-11-08).
+`_mix_stats_impl` in `python/sglang/srt/models/deepseek_v4_mhc.py:361-468`
+chooses the path that computes the projection and the sum of squares:
 
-- NVIDIA sm90/sm100 with `SGLANG_OPT_DEEPGEMM_HC_PRENORM` and batch-invariant
-  mode off: DeepGEMM / compensated bf16x3 projections; batch-invariant mode
-  disables them (`:384`).
-- `use_fused_stats` (Blackwell, some Hopper M ranges, and **gfx950**):
-  `hc_mix_stats_sinkhorn`, the same split kernel as below fused with Sinkhorn
-  ("The default split-K/Sinkhorn fusion preserves batch invariance", `:400`).
-- other CUDA: `hc_mix_stats` (`kernels/ops/layernorm/mhc.py:2237-2420`),
-  "cuBLAS/torch reductions can change order with num_tokens; this kernel keeps
-  the mixing and RMS reductions batch-invariant".
-- everything else, which includes **gfx942** (`torch.version.cuda` is None and
-  `use_fused_stats` needs gfx950): PyTorch eager `x.square().mean()` and
-  `F.linear` (`:446-449`), the DeepSeek reference arithmetic, no batch-invariance claim.
+- NVIDIA sm90 and sm100 with `SGLANG_OPT_DEEPGEMM_HC_PRENORM`: DeepGEMM; turned
+  off in batch-invariant mode (`:384`).
+- Blackwell, some Hopper ranges of `M`, and gfx950: `hc_mix_stats_sinkhorn`,
+  the kernel below fused with Sinkhorn ("The default split-K/Sinkhorn fusion
+  preserves batch invariance", `:400`).
+- Other CUDA GPUs: `hc_mix_stats` (`kernels/ops/layernorm/mhc.py:2237-2420`).
+- Everything else, which includes gfx942: plain PyTorch
+  `x.square().mean()` and `F.linear` (`:446-449`).
 
-`hc_mix_stats` is the closest reference to candidate A/B on AMD:
+`hc_mix_stats` is the closest reference for an AMD Triton kernel:
 
-- K slices from K only (`_num_slices_for`, choices 80 … 1), merged in slice
-  order (`_hc_mix_stats_reduce_kernel`); `BLOCK_K = 64`, `num_warps = 4` fixed;
-- the sum of squares is still `sq += tl.sum(x_tile * x_tile, axis=1)` per K
-  tile, i.e. its order rests on fixed constexprs, as in A;
-- `BLOCK_M` follows M on CUDA (8 / 16 / 32, "BLOCK_M 8/16/32 preserve each
-  row's K reduction order; thresholds were measured on GB300") but is fixed to
-  16 on HIP: "fp32 MFMA tile heights do not share a per-row reduction order, so
-  one height serves every M" (`_block_m_for`);
-- the projection is fp32: `input_precision="ieee"` on HIP ("Triton on AMD has
-  no tf32x3"), `tf32x3` on CUDA.
+- the number of K segments depends on K only (`_num_slices_for`), and the
+  segments are added in order; the K tile (64) and `num_warps` (4) are fixed;
+- the sum of squares is still `tl.sum(x_tile * x_tile, axis=1)` per K tile, so
+  its order rests on fixed constants, as in `aiter_config_table`;
+- `BLOCK_M` follows `M` on CUDA but is fixed to 16 on HIP, with the comment
+  "fp32 MFMA tile heights do not share a per-row reduction order, so one height
+  serves every M" (`_block_m_for`);
+- the projection runs in fp32 on HIP (`input_precision="ieee"`, "Triton on AMD
+  has no tf32x3").
 
-The aiter mHC path (`_use_aiter_mhc`, `kernels/ops/layernorm/mhc.py:37-43`) is
-gated on gfx950 and `SGLANG_USE_AITER`.
+SGLang's aiter mHC path (`_use_aiter_mhc`, `kernels/ops/layernorm/mhc.py:37-43`)
+is used only on gfx950 with `SGLANG_USE_AITER`.
 
-### 6.9 Summary of the references
+### 6.9 Overview
 
-| Implementation | Σx² fused with projection | Σx² tree | Fixed by | Depends on M | BI on ROCm |
-|---|---|---|---|---|---|
-| DSV4 official | no | PyTorch reduce | library | yes | no claim |
-| DeepGEMM | yes | written: per-thread serial + 4-lane butterfly | compile-time constants; `num_splits` from caller | no | NVIDIA only |
-| vLLM NVIDIA (#59929) | yes (DeepGEMM) | as DeepGEMM | split from M = 1 | no | — |
-| vLLM TileLang fallback | yes | written, thread count from M | `n_thr` 1024 / 512 | yes (M = 128) | no |
-| vLLM ROCm (aiter HIP) | yes | per-lane + fixed bpermute | `split_k`, `tile_k`, `tile_n` from M | yes | no |
-| vLLM BI RMSNorm | — | `tl.sum` per 1024 chunk | fixed constexprs | no | compiler-dependent |
-| SGLang `hc_mix_stats` | yes | `tl.sum` per 64 tile | slices from K; `BLOCK_K`, `num_warps` fixed; `BLOCK_M` fixed on HIP | no | used on gfx950 only; gfx942 runs eager PyTorch |
-| aiter Triton (A) | yes | `tl.sum`, layout from config | per-M table, layouts held equal | no (measured) | compiler-dependent |
+| Implementation | Projection and sum of squares in one kernel | How the order of the sum of squares is fixed | Depends on M | gfx942 |
+|---|---|---|---|---|
+| DeepSeek-V4 reference | no | by PyTorch | yes | not batch invariant |
+| DeepGEMM | yes | written in the kernel; tile sizes constant; caller chooses the K segments | no | NVIDIA only |
+| vLLM, NVIDIA | yes (DeepGEMM) | as DeepGEMM, K segments computed as for M = 1 | no | — |
+| vLLM, TileLang without DeepGEMM | yes | written in the kernel, but thread count chosen from M | yes, at M = 128 | — |
+| vLLM, ROCm (aiter HIP) | yes | written in the kernel; K segments, K tile and output tile chosen from M | yes | not batch invariant |
+| vLLM batch-invariant RMSNorm | — | `tl.sum` on 1024-value chunks with fixed constants | no | depends on the Triton version |
+| SGLang `hc_mix_stats` | yes | `tl.sum` per 64-value tile with fixed constants; `BLOCK_M` fixed on HIP | no | not used; gfx942 runs plain PyTorch |
+| aiter Triton with RL-Kernel's tables (`aiter_config_table`) | yes | `tl.sum` per tile; configs chosen so that layouts are equal | no (measured) | depends on the Triton version |
 
-## 7. Candidates
+## 7. Approaches we compared
 
-Baseline in every table: **A**, the current ops of the PR branch. All
-measurements: MI325X (gfx942), torch 2.12.0 + ROCm 7.14, Triton 3.7.0, aiter
-`326cffa`, n = 4, C = 4096, bf16 residual, fp32 `fn`, 20 Sinkhorn rounds.
-Jobs 68321539 and 68321590 unless noted; 68321590 reran everything after a
-line-wrapping refactor of B, whose outputs kept the same SHA-256 digests.
+All measurements: MI325X (gfx942), torch 2.12.0 with ROCm 7.14, Triton 3.7.0,
+aiter `326cffa`, `n = 4`, `C = 4096`, bf16 residual, fp32 weights, 20 Sinkhorn
+iterations. Jobs 68321539 and 68321590, script
+`benchmarks/operators/mhc/evaluate_mhc_candidates.py`, unless another job is
+named. Job 68321590 repeated everything after the `fixed_order` source was
+reformatted; its outputs had the same SHA-256 digests as before.
 
-### 7.1 The candidates
+### 7.1 What each approach does
 
-**A. aiter's Triton kernels with per-M configs whose layouts are equal (current).**
-`rl_engine/backends/rocm/mhc/aiter_mhc.py` passes a config per M from
-`configs/gfx942/mhc_{pre,head}/*.json`; the table loader forces `NUM_KSPLIT`,
-`BLOCK_K`, `kpack` (pre) and `BLOCK_M`, `BLOCK_K`, `BLOCK_C`, `num_warps`,
-`kpack` (head) to be equal in every entry. The remaining freedom (pre
-`BLOCK_M`, `BLOCK_C ≤ 128`, `num_warps`) is safe only because, with
-`BLOCK_K = 128`, Triton gives the same reduction layouts (section 4.2); two
-combinations that would not (`BLOCK_C = 256`, `BLOCK_M = 16` with
-`num_warps = 8`) are excluded by the tuner and the tests, not by the loader.
+**`aiter_config_table` (current, baseline).** `rl_engine/backends/rocm/mhc/aiter_mhc.py`
+passes aiter a config per `M` from `configs/gfx942/mhc_pre/*.json` and
+`configs/gfx942/mhc_head/*.json`. When a table is loaded, these parameters must
+be equal in every entry: `NUM_KSPLIT`, `BLOCK_K` and `kpack` for mHC pre;
+`BLOCK_M`, `BLOCK_K`, `BLOCK_C`, `num_warps` and `kpack` for mHC head. The
+freedom left for mHC pre (`BLOCK_M`, `BLOCK_C` up to 128, `num_warps`) is safe
+only because the layouts happen to stay equal (section 4.2). Two combinations
+that would break it (`BLOCK_C = 256`, and `BLOCK_M = 16` with `num_warps = 8`)
+are kept out by the tuner and the tests, not by the table loader.
 
-**B. Fixed-order Triton kernels in RL-Kernel.**
-`rl_engine/backends/rocm/mhc/fixed_order_mhc.py` (not registered as an op).
-Four kernels:
+**`fixed_order`.** `rl_engine/backends/rocm/mhc/fixed_order_mhc.py`, not
+registered as an op. Four Triton kernels:
 
-1. `_prenorm_kernel`, grid `(cdiv(M, BLOCK_M), S)`: one K segment of
-   `K / S` per workgroup; per K tile of `PRENORM_BLOCK_K = 128`:
-   `acc = tl.dot(x, fn_bf16, acc)` and `sq = tl.fma(x, x, sq)` with `sq` of
-   shape `[BLOCK_M, 128]` (element-wise, no reduction in the loop); after the
-   loop `_pairwise_sum_last` adds adjacent pairs in 7 levels
-   (`tl.sum(tl.reshape(v, (BLOCK_M, W/2, 2)), axis=2)`). A two-element sum has
-   one rounding whatever lanes hold the elements, so the tree is fixed by the
-   source.
-2. `_pre_apply_kernel` / `_head_apply_kernel`, grid `(cdiv(M, BLOCK_M), cdiv(C, BLOCK_C))`:
-   partials added in segment order (`_merge_splits`), RMS factor and
-   activations with the same expressions as aiter, stream sum written as
-   `li = pre0·x0; li = fma(pre1, x1, li); …` in stream order.
-3. `_sinkhorn_kernel`: `BLOCK_M` rows per workgroup, row and column sums and
-   maxima with the same pairwise tree over the 4 entries.
+1. `_prenorm_kernel` runs one K segment per workgroup. For each tile of 128 K
+   values (`PRENORM_BLOCK_K`) it does `acc = tl.dot(x, fn_bf16, acc)` and
+   `sq = tl.fma(x, x, sq)`, where `sq` has the shape of the tile, so no sum
+   happens inside the loop. After the loop, `_pairwise_sum_last` adds
+   neighbouring pairs of the 128 columns in 7 rounds:
 
-`S`, the number of K segments, is part of the arithmetic and must be one value
-per K; `num_k_splits(K) = clamp(K // 4096, 1, 16)` gives 4 for K = 16384.
-`PRENORM_BLOCK_K` is part of it too. Every other launch parameter only
-regroups rows and columns.
+   ```python
+   for i in tl.static_range(LOG2_WIDTH):
+       v = tl.sum(tl.reshape(v, (ROWS, WIDTH >> (i + 1), 2)), axis=2)
+   ```
 
-**C. The kernels of B inside a pinned aiter fork.** Same arithmetic as B (same
-source), so it was not measured separately. It differs in where the code lives:
-RL-Kernel does not pin aiter today (`pyproject.toml:34`: `rocm = ["aiter"]`
-without a version; the Dockerfiles and requirements do not install it), so C
-needs a pinned aiter version plus a patch, and every consumer must build that
-aiter.
+   Each `tl.sum` there adds exactly two numbers, which rounds the same way
+   whatever lanes hold them, so the order is set by the source.
+2. `_pre_apply_kernel` and `_head_apply_kernel` add the K segments in segment
+   order, compute the RMS factor and the activations with the same expressions
+   as aiter, and compute the weighted stream sum one stream at a time:
+   `out = w0·x0`, then `out = fma(w1, x1, out)`, and so on.
+3. `_sinkhorn_kernel` processes several tokens per workgroup and computes the
+   row and column sums of each 4×4 matrix with the same pairwise rounds.
 
-**D. Projection by the batch-invariant linear, sum of squares separately.**
-`fixed_order_mhc_pre(..., projection="aiter_linear")`: the projection runs as
-`AiterBatchInvariantLinearOp` (aiter `gemm_a16w16`, whole-K config), the sum of
-squares as B's `_prenorm_kernel` without the dot; x is read twice. Pre only.
+The number of K segments and the K tile of 128 are part of the arithmetic and
+must be the same for every `M`. `num_k_splits(K) = clamp(K // 4096, 1, 16)`
+gives 4 for `K = 16384`; 1 and 16 were measured as well. All other launch
+parameters only regroup tokens and hidden positions.
 
-**E. aiter's HIP `mhc_pre` with a fixed split.** The op vLLM's ROCm model calls
-(section 6.5).
+**`fixed_order_in_aiter_fork`.** The same source as `fixed_order`, so it was not
+measured separately. It differs only in where the code lives. RL-Kernel does
+not pin aiter today (`pyproject.toml:34` declares `rocm = ["aiter"]` without a
+version, and neither the Dockerfiles nor the requirements install it), so this
+approach also needs a way to pin a patched aiter.
 
-Implementation measured here: `mhc_pre_gemm_sqrsum` and `mhc_pre_big_fuse`
-called directly with one `(split_k, tile_k)` for every M; mhc_head as vLLM
-runs it (`vllm/_aiter_ops.py:4433-4480`): `fn` and `base` zero-padded to 24
-rows, `scale` to 3, no Sinkhorn, `layer_input` is the head output. The
-projection uses fp32 `fn` (`w_preshuffle_bf16 = 0`). What the measurements
-show beyond the split:
+**`separate_projection`.** `fixed_order_mhc_pre(..., projection="aiter_linear")`.
+The projection runs as `AiterBatchInvariantLinearOp` (aiter `gemm_a16w16`
+without K split), and the sum of squares as `fixed_order`'s `_prenorm_kernel`
+without the dot product. The residual is read twice. mHC pre only.
 
-- the kernels still choose internal parameters from M: `tile_n` 16 or 32 from
-  `m_blocks · split_k` vs the CU count (`mhc_kernels.cu:906-934`) and the
-  big-fuse launch from `m <= cu_num * 12` (`:1387-1392`, 3648 on MI325X).
-  With split_k = 1, 4 or 8 the bits did not change with M; with split_k = 64
-  they change from M = 4096 on, the first measured M above 3648;
-- `mhc_pre_gemm_sqrsum` reads only the row stride of the residual
-  (`x.stride(0)`, `:952`), so a residual whose streams are not contiguous gives
-  other results (strides column of 7.3); a wrapper must pass a contiguous
-  residual;
-- building it needs hipcc, the CK headers and aiter's JIT; `import aiter` in
-  the current image fails outside `AITER_TRITON_ONLY` (aiter needs flydsl ≥ 0.2.4,
-  the image has 0.1.6), so the probe imports only aiter's JIT core
-  (`AITER_AOT_IMPORT=1`). `mhc_pre_gemm_sqrsum` / `mhc_pre_big_fuse` are not
-  the public `mhc_pre` entry point.
+**`aiter_hip`.** aiter's `mhc_pre_gemm_sqrsum` and `mhc_pre_big_fuse` called
+directly with one number of K segments and one K tile for every `M`; mHC head
+as vLLM runs it (weights and bias padded to 24 rows, scale to 3, no Sinkhorn).
+The projection uses the fp32 weights. Points that matter for adoption:
 
-### 7.2 Bits do not depend on launch parameters (B)
+- the kernels still choose internal sizes from `M` (section 6.5). With 1, 4 or
+  8 K segments the bits did not change with `M`; with 64 segments they changed
+  from `M = 4096` on, which is the first measured `M` above the big-fuse
+  threshold `cu_num × 12 = 3648`;
+- `mhc_pre_gemm_sqrsum` reads only the token stride of the residual
+  (`x.stride(0)`, `mhc_kernels.cu:952`), so the streams of a token must be
+  contiguous; a wrapper must pass a contiguous residual;
+- it needs aiter's HIP build (hipcc, the composable_kernel headers, aiter's JIT).
+  In the current image `import aiter` fails unless `AITER_TRITON_ONLY=1`,
+  because aiter needs flydsl ≥ 0.2.4 and the image has 0.1.6; the measurement
+  imported only aiter's JIT core (`AITER_AOT_IMPORT=1`). The two functions are
+  internal, not aiter's public `mhc_pre`.
 
-Section 1 of the job: every launch parameter of B changed one at a time and in
-combinations, against B's default config, for `S` = 1, 4 and 16, at
-M = 1, 17, 1024 and 4096, every output compared bit for bit.
+### 7.2 Batch invariance
 
-| Op | Parameters changed | Configs | Result |
-|---|---|---|---|
-| pre | `BLOCK_M` 16/64/128, `num_warps` 2/8, `BLOCK_M=16 + num_warps=8`, `BLOCK_M=128 + num_warps=8`, `num_stages=2`, `waves_per_eu=2`, apply `BLOCK_M` 16/64, apply `BLOCK_C` 64/256, apply `num_warps` 2/8, Sinkhorn `BLOCK_M` 1/64 | 17 × 3 values of S | all same |
-| head | the same without Sinkhorn | 15 × 3 values of S | all same |
+Checks of `rl_engine/validation/common/batch_invariance.py`: a token alone
+compared with the same token at the first and last position of batches with
+`M` = 1, 8, 16, 17, 59, 64, 128, 256, 1024, 2048, 4096, 8192 and 16384;
+chunking, reordering and padding at `M` = 17 and 1024; non-contiguous inputs;
+two runs of the same batch. Cells name the outputs whose bits differ.
 
-For comparison, aiter's kernels change bits with `BLOCK_K`, `BLOCK_C=256`,
-`BLOCK_M=16 + num_warps=8`, `kpack` (pre) and `BLOCK_M`, `BLOCK_K`, `BLOCK_C`,
-`num_warps`, `kpack` (head) (section 5).
-
-### 7.3 Batch invariance
-
-`rl_engine/validation/common/batch_invariance.py`: two rows alone (M = 1) vs
-at the first and last position of a batch of M, for M = 1, 8, 16, 17, 59, 64,
-128, 256, 1024, 2048, 4096, 8192, 16384; chunking, reordering and padding
-(M = 17, 1024); other input strides; two runs.
-
-| Variant | mhc_pre | mhc_head |
+| Approach | mHC pre | mHC head |
 |---|---|---|
-| A | no difference | no difference |
-| B, S = 1 / 4 / 16 | no difference | no difference |
-| B, S = 4, launch config changing with M (`BLOCK_M=16, num_warps=8, BLOCK_C=256, Sinkhorn BLOCK_M=1` for M < 64, else `64 / 4 / 64 / 64`) | no difference | no difference |
-| D, S = 4 | no difference | — |
-| E, `mhc_pre` as vLLM calls it (split by M) | M = 1024 … 16384 differ; chunking differs; strides differ | M = 1024 … 16384 differ; chunking differs; strides differ |
-| E, fixed split_k × tile_k = 1×128, 4×128, 8×64 | no difference in batch, chunking and runs; strides differ | same |
-| E, fixed 64×128 | M = 4096, 8192, 16384 differ (comb_mix, layer_input); strides differ | M = 4096, 8192, 16384 differ; strides differ |
+| `aiter_config_table` | no difference | no difference |
+| `fixed_order` with 1, 4 or 16 K segments | no difference | no difference |
+| `fixed_order` with 4 K segments and a launch config that changes with M (`BLOCK_M = 16`, `num_warps = 8`, `BLOCK_C = 256`, 1 token per Sinkhorn workgroup below M = 64; 64, 4, 64, 64 from M = 64 on) | no difference | no difference |
+| `separate_projection` with 4 K segments | no difference | — |
+| aiter HIP with the split chosen per M (as vLLM calls it) | all outputs differ from M = 1024 on; also after chunking and with non-contiguous inputs | output differs from M = 1024 on; also after chunking and with non-contiguous inputs |
+| `aiter_hip` with 1, 4 or 8 K segments | differs only with non-contiguous inputs | differs only with non-contiguous inputs |
+| `aiter_hip` with 64 K segments | `comb_mix` and `layer_input` differ at M = 4096, 8192, 16384; non-contiguous inputs differ | output differs at M = 4096, 8192, 16384; non-contiguous inputs differ |
 
-E rows: job 68322040.
+The aiter HIP rows come from job 68322040.
 
-### 7.4 Error against the fp32 reference
+### 7.3 Independence from launch parameters (`fixed_order`)
 
-M = 1024, random inputs; reference `NativeMHCPreOp.forward_fp32` /
-`NativeMHCHeadOp.forward_fp32` (fp32 `fn`). Max / mean absolute error.
+Every launch parameter of `fixed_order` was changed, alone and in a few
+combinations, against its default config, with 1, 4 and 16 K segments, at
+`M` = 1, 17, 1024 and 4096. Every output was compared bit for bit.
 
-| Variant | post_mix | comb_mix | layer_input | head output |
-|---|---|---|---|---|
-| aiter default | 3.600e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | 1.893e-02 / 1.393e-03 |
-| A (baseline) | 3.601e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | 1.893e-02 / 1.393e-03 |
-| B, S = 1 | 3.600e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | 1.893e-02 / 1.393e-03 |
-| B, S = 4 | 3.601e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | 1.893e-02 / 1.393e-03 |
-| B, S = 16 | 3.600e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | 1.893e-02 / 1.393e-03 |
-| D, S = 4 | 3.600e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | — |
-| E, split by M | 1.311e-06 / 2.162e-07 | 5.066e-07 / 7.387e-08 | 3.125e-02 / 2.532e-03 | 3.125e-02 / 2.426e-03 |
-| E, fixed 1×128 | 6.437e-06 / 8.687e-07 | 2.503e-06 / 3.232e-07 | 3.124e-02 / 2.532e-03 | 3.125e-02 / 2.426e-03 |
-| E, fixed 4×128 | 3.934e-06 / 4.871e-07 | 9.835e-07 / 1.582e-07 | 3.124e-02 / 2.532e-03 | 3.125e-02 / 2.426e-03 |
-| E, fixed 8×64 | 2.384e-06 / 3.673e-07 | 7.153e-07 / 1.202e-07 | 3.124e-02 / 2.532e-03 | 3.125e-02 / 2.426e-03 |
+| Kernel | Parameters changed | Configs | Result |
+|---|---|---|---|
+| mHC pre | `BLOCK_M` 16/64/128; `num_warps` 2/8; `BLOCK_M = 16` with `num_warps = 8`; `BLOCK_M = 128` with `num_warps = 8`; `num_stages = 2`; `waves_per_eu = 2`; tile of the apply kernel 16/64 tokens and 64/256 hidden positions; `num_warps` of the apply kernel 2/8; 1 or 64 tokens per Sinkhorn workgroup | 17 for each of the 3 segment counts | all identical |
+| mHC head | the same without Sinkhorn | 15 for each of the 3 segment counts | all identical |
 
-A, B and D round `fn` to bf16 as aiter's Triton kernels do; their mixing
-weights are three orders of magnitude further from the fp32 reference than
-E's, which projects with fp32 `fn`. E's `layer_input` and head output have a
-1.7× larger mean error than A's; why was not investigated. The reduction order
-of A, B and D does not show at this scale.
+For comparison, aiter's kernels change bits with `BLOCK_K`, `BLOCK_C = 256`,
+`BLOCK_M = 16` together with `num_warps = 8`, and `kpack` (mHC pre), and with
+`BLOCK_M`, `BLOCK_K`, `BLOCK_C`, `num_warps` and `kpack` (mHC head), section 5.
 
-### 7.5 Triton version
+### 7.4 Triton 3.7.0 against Triton 3.8.0
 
-SHA-256 of every output for fixed inputs (random, M = 17 and 1024), Triton
-3.7.0 (image) vs 3.8.0 (`3.8.0+amd.rocm7.2.0.git7cb7b059`), same GPU, same job:
+SHA-256 digests of every output for the same inputs, computed with the image's
+Triton 3.7.0 and with Triton 3.8.0 (`3.8.0+amd.rocm7.2.0.git7cb7b059`) on the
+same GPU (jobs 68321539, 68321590 and 68321583):
 
-| Outputs | 3.7.0 vs 3.8.0 |
+| Outputs | 3.7.0 and 3.8.0 |
 |---|---|
-| A pre (table class, `NUM_KSPLIT=4`), M = 17 | same |
-| A pre (table class, `NUM_KSPLIT=4`), M = 1024 | all three outputs differ |
-| A head (aiter's config), M = 17 and 1024 | differs |
-| B pre, S = 4, M = 17 and 1024 | same |
-| B head, S = 4, M = 17 and 1024 | same |
+| `aiter_config_table` mHC pre (4 K segments), M = 17 | equal |
+| `aiter_config_table` mHC pre (4 K segments), M = 1024 | all three outputs differ |
+| `aiter_config_table` mHC head (aiter's config), M = 17 and 1024 | differ |
+| `fixed_order` mHC pre and mHC head (4 K segments), M = 17 and 1024 | equal |
 
-Which reduction moves (job 68321583, `analyze_aiter_reductions.py --digest`,
-the three class references of section 5 on the four input kinds, M = 17 and
-1024, Triton 3.7.0 vs 3.8.0):
+Which sum moves (job 68321583, the three aiter configs of section 5 on the
+four kinds of input):
 
-| Class | random | exact sum of squares | exact projection | both exact |
+| aiter config | random input | exact sum of squares | exact projection | both exact |
 |---|---|---|---|---|
-| pre `NUM_KSPLIT=1` | M = 17 same; M = 1024 post_mix, comb_mix differ | same | M = 17 same; M = 1024 all three differ | same |
-| pre `NUM_KSPLIT=4` | M = 17 same; M = 1024 all three differ | same | M = 17 same; M = 1024 all three differ | same |
-| head | differs at M = 17 and 1024 | same | differs at M = 17 and 1024 | same |
+| mHC pre, no K split | M = 17 equal; M = 1024 `post_mix`, `comb_mix` differ | equal | M = 17 equal; M = 1024 all three differ | equal |
+| mHC pre, 4 K segments | M = 17 equal; M = 1024 all three differ | equal | M = 17 equal; M = 1024 all three differ | equal |
+| mHC head | differs at M = 17 and 1024 | equal | differs at M = 17 and 1024 | equal |
 
-Differences appear only when the sum of squares rounds, so the moving
-reduction is the sum-of-squares `tl.sum`, with the same layout in both
-versions. Triton 3.8.0 changed how a thread adds its own elements:
-v3.7.0 `reduceWithinThreads` folds them left to right
-(`lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp:142-150`), v3.8.0 adds them
-as a binary tree (`treeReduce`, `ReduceOpToLLVM.cpp:116-142` and `:286-303` of
-tag `v3.8.0`; arity 2 for additions, `TargetInfo.cpp:689-697`), optionally on
-packed fp32 pairs. With 4 or 8 elements per thread the two orders differ.
-Why mhc_pre at M = 17 keeps its bits was not investigated (M is a
-`tl.constexpr` of these kernels, so M = 17 and 1024 compile separately).
-B's pairwise reductions add two elements per `tl.sum`, where the two lowerings
-coincide.
+The outputs differ only when the sum of squares rounds, so the sum that moves
+is the sum of squares, whose layout is the same in both versions; the cause is
+the new order inside a thread (section 4.3). Why mHC pre keeps its bits at
+`M = 17` was not investigated (`M` is a compile-time constant of these kernels,
+so `M = 17` and `M = 1024` are compiled separately).
+
+### 7.5 Error against the fp32 reference
+
+`M = 1024`, random input. Reference: `NativeMHCPreOp.forward_fp32` and
+`NativeMHCHeadOp.forward_fp32`, which project with the fp32 weights. Each cell:
+largest / mean absolute error.
+
+| Approach | `post_mix` | `comb_mix` | `layer_input` | mHC head output |
+|---|---|---|---|---|
+| `aiter_own_config` | 3.600e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | 1.893e-02 / 1.393e-03 |
+| `aiter_config_table` (baseline) | 3.601e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | 1.893e-02 / 1.393e-03 |
+| `fixed_order`, 1 / 4 / 16 K segments | 3.600e-03 to 3.601e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | 1.893e-02 / 1.393e-03 |
+| `separate_projection`, 4 K segments | 3.600e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | — |
+| aiter HIP, split chosen per M | 1.311e-06 / 2.162e-07 | 5.066e-07 / 7.387e-08 | 3.125e-02 / 2.532e-03 | 3.125e-02 / 2.426e-03 |
+| `aiter_hip`, 1 K segment | 6.437e-06 / 8.687e-07 | 2.503e-06 / 3.232e-07 | 3.124e-02 / 2.532e-03 | 3.125e-02 / 2.426e-03 |
+| `aiter_hip`, 4 K segments | 3.934e-06 / 4.871e-07 | 9.835e-07 / 1.582e-07 | 3.124e-02 / 2.532e-03 | 3.125e-02 / 2.426e-03 |
+| `aiter_hip`, 8 K segments | 2.384e-06 / 3.673e-07 | 7.153e-07 / 1.202e-07 | 3.124e-02 / 2.532e-03 | 3.125e-02 / 2.426e-03 |
+
+The Triton approaches round the weights to bf16 before the projection, as
+aiter's Triton kernels do, and that rounding dominates their error; the order
+of the sums does not show at this scale. `aiter_hip` projects with the fp32
+weights, so its mixing weights are about 1000 times closer to the reference.
+Its `layer_input` and head output have a 1.7 times larger mean error than the
+baseline; the cause was not investigated.
 
 ### 7.6 Device time
 
-Forward, ms per call from GPU events around a CUDA graph of 20 calls; median
-over 5 replays. Two runs on the same node (jobs 68321539 and 68321590); each
-cell gives the range of the two medians, each ratio the range of the per-run
-ratios. Baseline: A. Ratio columns: variant / A (below 1: faster than A).
-B and D: the fastest of 18 launch configs per M (`BLOCK_M` 16/32/64 ×
-`num_warps` 2/4/8 × two apply tiles), all with the same bits (7.2).
-aiter default is shown for reference; it is not batch invariant and cannot
-launch at M = 8192 on gfx942 (needs 128 KB of LDS).
+Forward pass, milliseconds per call, measured with GPU events around a CUDA
+graph of 20 calls, median over 5 replays. Baseline: `aiter_config_table`. Every
+ratio column is time of the approach divided by time of the baseline in the
+same run; below 1 means faster than the baseline. For `fixed_order` and
+`separate_projection` each cell is the fastest of 18 launch configs
+(`BLOCK_M` 16/32/64 × `num_warps` 2/4/8 × two apply tiles), which all give the
+same bits (7.3). `aiter_own_config` is not batch invariant and is shown only for
+reference; it cannot launch at `M = 8192` on gfx942 because it needs 128 KB of
+LDS.
 
-#### mhc_pre
+The first two tables come from two runs on the same node (jobs 68321539 and
+68321590); a cell with two numbers gives the lowest and highest of the two run
+medians.
 
-| M | aiter default (ms) | A (ms) | B S=1 (ms) | B S=4 (ms) | B S=16 (ms) | D S=4 (ms) | aiter default / A (ratio) | B S=1 / A (ratio) | B S=4 / A (ratio) | B S=16 / A (ratio) | D S=4 / A (ratio) |
+#### mHC pre
+
+| M | `aiter_config_table` (ms) | `fixed_order`, 4 K segments (ms) | `fixed_order`, 16 K segments (ms) | `fixed_order`, 1 K segment (ms) | `separate_projection`, 4 K segments (ms) | `aiter_own_config` (ms) | `fixed_order` 4 segments / baseline (ratio) | `fixed_order` 16 segments / baseline (ratio) | `fixed_order` 1 segment / baseline (ratio) | `separate_projection` / baseline (ratio) | `aiter_own_config` / baseline (ratio) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 0.1983–0.1987 | 0.0558–0.0559 | 0.1379–0.1386 | 0.0451–0.0457 | 0.0236–0.0238 | 0.1976–0.1981 | 3.55 | 2.47–2.48 | 0.81–0.82 | 0.42–0.43 | 3.54 |
-| 16 | 0.2433–0.2437 | 0.0497–0.0498 | 0.1350–0.1357 | 0.0442–0.0443 | 0.0245–0.0246 | 0.1974–0.1979 | 4.89–4.90 | 2.72 | 0.89 | 0.49 | 3.97 |
-| 64 | 0.2507–0.2508 | 0.0652–0.0654 | 0.1362 | 0.0446 | 0.0238 | 0.1974–0.1977 | 3.83–3.85 | 2.08–2.09 | 0.68 | 0.36–0.37 | 3.02–3.03 |
-| 256 | 0.2554–0.2555 | 0.0589 | 0.1368 | 0.0452–0.0453 | 0.0253 | 0.2026–0.2035 | 4.34 | 2.32 | 0.77 | 0.43 | 3.44–3.46 |
-| 1024 | 0.0511–0.0522 | 0.0841–0.0850 | 0.1642 | 0.0586–0.0588 | 0.0466–0.0468 | 0.2183–0.2184 | 0.61 | 1.93–1.95 | 0.69–0.70 | 0.55 | 2.57–2.60 |
-| 2048 | 0.0885–0.0890 | 0.0803–0.0820 | 0.1747–0.1753 | 0.0738–0.0744 | 0.0684–0.0687 | 0.2363–0.2372 | 1.08–1.11 | 2.14–2.18 | 0.90–0.93 | 0.84–0.85 | 2.89–2.94 |
-| 4096 | 0.1437–0.1465 | 0.1215–0.1239 | 0.1940–0.1947 | 0.1154–0.1174 | 0.1033–0.1063 | 0.2665–0.2679 | 1.16–1.21 | 1.57–1.60 | 0.95 | 0.83–0.87 | 2.15–2.20 |
-| 8192 | cannot launch: OutOfResources | 0.2190–0.2255 | 0.2701–0.2703 | 0.1998–0.2006 | 0.2166–0.2206 | 0.3578–0.3581 | n/a | 1.20–1.23 | 0.89–0.91 | 0.98–0.99 | 1.59–1.64 |
-| 16384 | 0.4666–0.4827 | 0.4127–0.4644 | 0.4648–0.4899 | 0.3828–0.4242 | 0.4860–0.4979 | 0.5748–0.6097 | 1.04–1.13 | 1.05–1.13 | 0.91–0.93 | 1.07–1.18 | 1.31–1.39 |
-| 32768 | 0.8925–0.9091 | 0.8072–0.8273 | 0.8400–0.8833 | 0.7564–0.7920 | 1.0888–1.1070 | 1.1640–1.2162 | 1.10–1.11 | 1.04–1.07 | 0.94–0.96 | 1.32–1.37 | 1.44–1.47 |
-| 65536 | 1.6955–1.7916 | 1.5191–1.6493 | 1.4096–1.5215 | 1.4373–1.5711 | 2.2426–2.2810 | 2.3081–2.4126 | 1.09–1.12 | 0.92–0.93 | 0.95 | 1.38–1.48 | 1.46–1.52 |
+| 1 | 0.0558–0.0559 | 0.0451–0.0457 | 0.0236–0.0238 | 0.1379–0.1386 | 0.1976–0.1981 | 0.1983–0.1987 | 0.81–0.82 | 0.42–0.43 | 2.47–2.48 | 3.54 | 3.55 |
+| 16 | 0.0497–0.0498 | 0.0442–0.0443 | 0.0245–0.0246 | 0.1350–0.1357 | 0.1974–0.1979 | 0.2433–0.2437 | 0.89 | 0.49 | 2.72 | 3.97 | 4.89–4.90 |
+| 64 | 0.0652–0.0654 | 0.0446 | 0.0238 | 0.1362 | 0.1974–0.1977 | 0.2507–0.2508 | 0.68 | 0.36–0.37 | 2.08–2.09 | 3.02–3.03 | 3.83–3.85 |
+| 256 | 0.0589 | 0.0452–0.0453 | 0.0253 | 0.1368 | 0.2026–0.2035 | 0.2554–0.2555 | 0.77 | 0.43 | 2.32 | 3.44–3.46 | 4.34 |
+| 1024 | 0.0841–0.0850 | 0.0586–0.0588 | 0.0466–0.0468 | 0.1642 | 0.2183–0.2184 | 0.0511–0.0522 | 0.69–0.70 | 0.55 | 1.93–1.95 | 2.57–2.60 | 0.61 |
+| 2048 | 0.0803–0.0820 | 0.0738–0.0744 | 0.0684–0.0687 | 0.1747–0.1753 | 0.2363–0.2372 | 0.0885–0.0890 | 0.90–0.93 | 0.84–0.85 | 2.14–2.18 | 2.89–2.94 | 1.08–1.11 |
+| 4096 | 0.1215–0.1239 | 0.1154–0.1174 | 0.1033–0.1063 | 0.1940–0.1947 | 0.2665–0.2679 | 0.1437–0.1465 | 0.95 | 0.83–0.87 | 1.57–1.60 | 2.15–2.20 | 1.16–1.21 |
+| 8192 | 0.2190–0.2255 | 0.1998–0.2006 | 0.2166–0.2206 | 0.2701–0.2703 | 0.3578–0.3581 | cannot launch (LDS) | 0.89–0.91 | 0.98–0.99 | 1.20–1.23 | 1.59–1.64 | — |
+| 16384 | 0.4127–0.4644 | 0.3828–0.4242 | 0.4860–0.4979 | 0.4648–0.4899 | 0.5748–0.6097 | 0.4666–0.4827 | 0.91–0.93 | 1.07–1.18 | 1.05–1.13 | 1.31–1.39 | 1.04–1.13 |
+| 32768 | 0.8072–0.8273 | 0.7564–0.7920 | 1.0888–1.1070 | 0.8400–0.8833 | 1.1640–1.2162 | 0.8925–0.9091 | 0.94–0.96 | 1.32–1.37 | 1.04–1.07 | 1.44–1.47 | 1.10–1.11 |
+| 65536 | 1.5191–1.6493 | 1.4373–1.5711 | 2.2426–2.2810 | 1.4096–1.5215 | 2.3081–2.4126 | 1.6955–1.7916 | 0.95 | 1.38–1.48 | 0.92–0.93 | 1.46–1.52 | 1.09–1.12 |
 
-#### mhc_head
+#### mHC head
 
-| M | aiter default (ms) | A (ms) | B S=1 (ms) | B S=4 (ms) | B S=16 (ms) | aiter default / A (ratio) | B S=1 / A (ratio) | B S=4 / A (ratio) | B S=16 / A (ratio) |
+| M | `aiter_config_table` (ms) | `fixed_order`, 4 K segments (ms) | `fixed_order`, 16 K segments (ms) | `fixed_order`, 1 K segment (ms) | `aiter_own_config` (ms) | `fixed_order` 4 segments / baseline (ratio) | `fixed_order` 16 segments / baseline (ratio) | `fixed_order` 1 segment / baseline (ratio) | `aiter_own_config` / baseline (ratio) |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 0.8209–0.8214 | 0.7451–0.7457 | 0.1030 | 0.0297–0.0301 | 0.0128–0.0129 | 1.10 | 0.14 | 0.04 | 0.02 |
-| 16 | 0.8334–0.8335 | 0.7464–0.7467 | 0.1023–0.1025 | 0.0296–0.0297 | 0.0128 | 1.12 | 0.14 | 0.04 | 0.02 |
-| 64 | 0.8358–0.8360 | 0.7483 | 0.1029–0.1030 | 0.0296 | 0.0129 | 1.12 | 0.14 | 0.04 | 0.02 |
-| 256 | 0.8380–0.8382 | 0.7431–0.7432 | 0.1034 | 0.0300 | 0.0135 | 1.13 | 0.14 | 0.04 | 0.02 |
-| 1024 | 0.9005 | 0.7759–0.7772 | 0.1251–0.1253 | 0.0411 | 0.0249–0.0250 | 1.16 | 0.16 | 0.05 | 0.03 |
-| 2048 | 0.9077–0.9080 | 0.7802–0.7812 | 0.1346–0.1347 | 0.0597–0.0604 | 0.0422–0.0433 | 1.16 | 0.17 | 0.08 | 0.05–0.06 |
-| 4096 | 0.9139–0.9153 | 0.7872–0.7886 | 0.1530–0.1531 | 0.0811–0.0816 | 0.0761–0.0772 | 1.16 | 0.19 | 0.10 | 0.10 |
-| 8192 | 1.9152–1.9159 | 1.4278–1.4318 | 0.2327–0.2362 | 0.1469–0.1470 | 0.1502–0.1524 | 1.34 | 0.16–0.17 | 0.10 | 0.10–0.11 |
-| 16384 | 3.8589–3.8630 | 2.8747–2.8792 | 0.3977–0.4608 | 0.3503–0.4345 | 0.3524–0.4188 | 1.34 | 0.14–0.16 | 0.12–0.15 | 0.12–0.15 |
-| 32768 | 6.7778–6.7855 | 5.1495–5.1618 | 0.6797–0.6988 | 0.6799–0.7074 | 0.7172–0.7296 | 1.31–1.32 | 0.13–0.14 | 0.13–0.14 | 0.14 |
-| 65536 | 12.0050–12.0124 | 10.7165–10.7307 | 1.2655–1.3696 | 1.2896–1.3927 | 1.4297–1.5369 | 1.12 | 0.12–0.13 | 0.12–0.13 | 0.13–0.14 |
+| 1 | 0.7451–0.7457 | 0.0297–0.0301 | 0.0128–0.0129 | 0.1030 | 0.8209–0.8214 | 0.04 | 0.02 | 0.14 | 1.10 |
+| 16 | 0.7464–0.7467 | 0.0296–0.0297 | 0.0128 | 0.1023–0.1025 | 0.8334–0.8335 | 0.04 | 0.02 | 0.14 | 1.12 |
+| 64 | 0.7483 | 0.0296 | 0.0129 | 0.1029–0.1030 | 0.8358–0.8360 | 0.04 | 0.02 | 0.14 | 1.12 |
+| 256 | 0.7431–0.7432 | 0.0300 | 0.0135 | 0.1034 | 0.8380–0.8382 | 0.04 | 0.02 | 0.14 | 1.13 |
+| 1024 | 0.7759–0.7772 | 0.0411 | 0.0249–0.0250 | 0.1251–0.1253 | 0.9005 | 0.05 | 0.03 | 0.16 | 1.16 |
+| 2048 | 0.7802–0.7812 | 0.0597–0.0604 | 0.0422–0.0433 | 0.1346–0.1347 | 0.9077–0.9080 | 0.08 | 0.05–0.06 | 0.17 | 1.16 |
+| 4096 | 0.7872–0.7886 | 0.0811–0.0816 | 0.0761–0.0772 | 0.1530–0.1531 | 0.9139–0.9153 | 0.10 | 0.10 | 0.19 | 1.16 |
+| 8192 | 1.4278–1.4318 | 0.1469–0.1470 | 0.1502–0.1524 | 0.2327–0.2362 | 1.9152–1.9159 | 0.10 | 0.10–0.11 | 0.16–0.17 | 1.34 |
+| 16384 | 2.8747–2.8792 | 0.3503–0.4345 | 0.3524–0.4188 | 0.3977–0.4608 | 3.8589–3.8630 | 0.12–0.15 | 0.12–0.15 | 0.14–0.16 | 1.34 |
+| 32768 | 5.1495–5.1618 | 0.6799–0.7074 | 0.7172–0.7296 | 0.6797–0.6988 | 6.7778–6.7855 | 0.13–0.14 | 0.14 | 0.13–0.14 | 1.31–1.32 |
+| 65536 | 10.7165–10.7307 | 1.2896–1.3927 | 1.4297–1.5369 | 1.2655–1.3696 | 12.0050–12.0124 | 0.12–0.13 | 0.13–0.14 | 0.12–0.13 | 1.12 |
 
-#### Candidate E, with A and B from the same job
+The baseline mHC head is slow because aiter's head kernel lets one workgroup
+of 16 tokens run the whole loop over K and over the hidden positions; at
+`M = 1` a single workgroup does all the work.
 
-Job 68322040, same node and method; A and B measured first in the same job
-(`evaluate_mhc_candidates.py --sections 4`), E second. One run. E has no
+#### `aiter_hip`, with the baseline and `fixed_order` from the same run
+
+Job 68322040, one run on the same node: `evaluate_mhc_candidates.py
+--sections 4` first, then `probe_aiter_hip_mhc_pre.py`. `aiter_hip` has no
 launch parameters to tune.
 
-##### mhc_pre
+| M | baseline, pre (ms) | `fixed_order` 4 segments, pre (ms) | `aiter_hip` 4 segments, pre (ms) | `aiter_hip` 8 segments, pre (ms) | `fixed_order` 4 segments / baseline, pre (ratio) | `aiter_hip` 4 segments / baseline, pre (ratio) | `aiter_hip` 8 segments / baseline, pre (ratio) | baseline, head (ms) | `fixed_order` 4 segments, head (ms) | `aiter_hip` 8 segments, head (ms) | `aiter_hip` 8 segments / baseline, head (ratio) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0.0561 | 0.0452 | 0.0391 | 0.0242 | 0.81 | 0.70 | 0.43 | 0.7450 | 0.0298 | 0.0231 | 0.03 |
+| 16 | 0.0504 | 0.0441 | 0.0405 | 0.0244 | 0.88 | 0.80 | 0.48 | 0.7463 | 0.0298 | 0.0234 | 0.03 |
+| 64 | 0.0654 | 0.0447 | 0.0414 | 0.0248 | 0.68 | 0.63 | 0.38 | 0.7481 | 0.0295 | 0.0238 | 0.03 |
+| 256 | 0.0590 | 0.0452 | 0.0420 | 0.0267 | 0.77 | 0.71 | 0.45 | 0.7430 | 0.0301 | 0.0264 | 0.04 |
+| 1024 | 0.0845 | 0.0587 | 0.0515 | 0.0352 | 0.69 | 0.61 | 0.42 | 0.7776 | 0.0413 | 0.0350 | 0.05 |
+| 2048 | 0.0849 | 0.0747 | 0.0645 | 0.0565 | 0.88 | 0.76 | 0.67 | 0.7810 | 0.0603 | 0.0590 | 0.08 |
+| 4096 | 0.1227 | 0.1133 | 0.1195 | 0.1174 | 0.92 | 0.97 | 0.96 | 0.7877 | 0.0815 | 0.1140 | 0.14 |
+| 8192 | 0.2141 | 0.1988 | 0.2017 | 0.2086 | 0.93 | 0.94 | 0.97 | 1.4302 | 0.1485 | 0.1979 | 0.14 |
+| 16384 | 0.4421 | 0.4115 | 0.3875 | 0.3676 | 0.93 | 0.88 | 0.83 | 2.8778 | 0.3579 | 0.3547 | 0.12 |
+| 32768 | 0.7796 | 0.7262 | 0.7316 | 0.7280 | 0.93 | 0.94 | 0.93 | 5.1556 | 0.6657 | 0.6916 | 0.13 |
+| 65536 | 1.5166 | 1.4563 | 1.4735 | 1.4556 | 0.96 | 0.97 | 0.96 | 10.6996 | 1.2847 | 1.3890 | 0.13 |
 
-| M | A (ms) | B S=4 (ms) | B S=16 (ms) | E aiter split (ms) | E fixed 1x128 (ms) | E fixed 4x128 (ms) | E fixed 8x64 (ms) | E fixed 64x128 (ms) | B S=4 / A (ratio) | B S=16 / A (ratio) | E aiter split / A (ratio) | E fixed 1x128 / A (ratio) | E fixed 4x128 / A (ratio) | E fixed 8x64 / A (ratio) | E fixed 64x128 / A (ratio) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 0.0561 | 0.0452 | 0.0236 | 0.0089 | 0.1360 | 0.0391 | 0.0242 | 0.0089 | 0.81 | 0.42 | 0.16 | 2.42 | 0.70 | 0.43 | 0.16 |
-| 16 | 0.0504 | 0.0441 | 0.0238 | 0.0093 | 0.1397 | 0.0405 | 0.0244 | 0.0093 | 0.88 | 0.47 | 0.18 | 2.77 | 0.80 | 0.48 | 0.18 |
-| 64 | 0.0654 | 0.0447 | 0.0237 | 0.0101 | 0.1418 | 0.0414 | 0.0248 | 0.0101 | 0.68 | 0.36 | 0.15 | 2.17 | 0.63 | 0.38 | 0.15 |
-| 256 | 0.0590 | 0.0452 | 0.0254 | 0.0139 | 0.1421 | 0.0420 | 0.0267 | 0.0140 | 0.77 | 0.43 | 0.24 | 2.41 | 0.71 | 0.45 | 0.24 |
-| 1024 | 0.0845 | 0.0587 | 0.0464 | 0.0342 | 0.1520 | 0.0515 | 0.0352 | 0.0383 | 0.69 | 0.55 | 0.40 | 1.80 | 0.61 | 0.42 | 0.45 |
-| 2048 | 0.0849 | 0.0747 | 0.0690 | 0.0575 | 0.1613 | 0.0645 | 0.0565 | 0.0644 | 0.88 | 0.81 | 0.68 | 1.90 | 0.76 | 0.67 | 0.76 |
-| 4096 | 0.1227 | 0.1133 | 0.1061 | 0.1125 | 0.1840 | 0.1195 | 0.1174 | 0.1283 | 0.92 | 0.86 | 0.92 | 1.50 | 0.97 | 0.96 | 1.05 |
-| 8192 | 0.2141 | 0.1988 | 0.2179 | 0.2058 | 0.2426 | 0.2017 | 0.2086 | 0.2435 | 0.93 | 1.02 | 0.96 | 1.13 | 0.94 | 0.97 | 1.14 |
-| 16384 | 0.4421 | 0.4115 | 0.5062 | 0.3879 | 0.4307 | 0.3875 | 0.3676 | 0.4685 | 0.93 | 1.14 | 0.88 | 0.97 | 0.88 | 0.83 | 1.06 |
-| 32768 | 0.7796 | 0.7262 | 1.0758 | 0.7713 | 0.7671 | 0.7316 | 0.7280 | 0.9336 | 0.93 | 1.38 | 0.99 | 0.98 | 0.94 | 0.93 | 1.20 |
-| 65536 | 1.5166 | 1.4563 | 2.2401 | 1.5320 | 1.5325 | 1.4735 | 1.4556 | 1.8881 | 0.96 | 1.48 | 1.01 | 1.01 | 0.97 | 0.96 | 1.24 |
-
-##### mhc_head
-
-| M | A (ms) | B S=4 (ms) | B S=16 (ms) | E aiter split (ms) | E fixed 1x128 (ms) | E fixed 4x128 (ms) | E fixed 8x64 (ms) | E fixed 64x128 (ms) | B S=4 / A (ratio) | B S=16 / A (ratio) | E aiter split / A (ratio) | E fixed 1x128 / A (ratio) | E fixed 4x128 / A (ratio) | E fixed 8x64 / A (ratio) | E fixed 64x128 / A (ratio) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 0.7450 | 0.0298 | 0.0129 | 0.0079 | 0.1351 | 0.0381 | 0.0231 | 0.0078 | 0.04 | 0.02 | 0.01 | 0.18 | 0.05 | 0.03 | 0.01 |
-| 16 | 0.7463 | 0.0298 | 0.0129 | 0.0082 | 0.1387 | 0.0395 | 0.0234 | 0.0082 | 0.04 | 0.02 | 0.01 | 0.19 | 0.05 | 0.03 | 0.01 |
-| 64 | 0.7481 | 0.0295 | 0.0129 | 0.0091 | 0.1403 | 0.0403 | 0.0238 | 0.0090 | 0.04 | 0.02 | 0.01 | 0.19 | 0.05 | 0.03 | 0.01 |
-| 256 | 0.7430 | 0.0301 | 0.0136 | 0.0137 | 0.1421 | 0.0418 | 0.0264 | 0.0137 | 0.04 | 0.02 | 0.02 | 0.19 | 0.06 | 0.04 | 0.02 |
-| 1024 | 0.7776 | 0.0413 | 0.0250 | 0.0329 | 0.1518 | 0.0512 | 0.0350 | 0.0378 | 0.05 | 0.03 | 0.04 | 0.20 | 0.07 | 0.05 | 0.05 |
-| 2048 | 0.7810 | 0.0603 | 0.0424 | 0.0560 | 0.1610 | 0.0636 | 0.0590 | 0.0627 | 0.08 | 0.05 | 0.07 | 0.21 | 0.08 | 0.08 | 0.08 |
-| 4096 | 0.7877 | 0.0815 | 0.0764 | 0.1077 | 0.1829 | 0.1196 | 0.1140 | 0.1233 | 0.10 | 0.10 | 0.14 | 0.23 | 0.15 | 0.14 | 0.16 |
-| 8192 | 1.4302 | 0.1485 | 0.1489 | 0.1968 | 0.2370 | 0.1961 | 0.1979 | 0.2359 | 0.10 | 0.10 | 0.14 | 0.17 | 0.14 | 0.14 | 0.16 |
-| 16384 | 2.8778 | 0.3579 | 0.3620 | 0.3807 | 0.4254 | 0.3782 | 0.3547 | 0.4527 | 0.12 | 0.13 | 0.13 | 0.15 | 0.13 | 0.12 | 0.16 |
-| 32768 | 5.1556 | 0.6657 | 0.7082 | 0.7426 | 0.7406 | 0.6901 | 0.6916 | 0.9060 | 0.13 | 0.14 | 0.14 | 0.14 | 0.13 | 0.13 | 0.18 |
-| 65536 | 10.6996 | 1.2847 | 1.4338 | 1.4877 | 1.4782 | 1.4040 | 1.3890 | 1.8281 | 0.12 | 0.13 | 0.14 | 0.14 | 0.13 | 0.13 | 0.17 |
+The full table, with 1 and 64 K segments and with the split chosen per `M`, is
+in `/home/AMD/zitwang/dev/logs/mhc-hip-probe-68322040.md`.
 
 ### 7.7 Comparison
 
-All numbers from the sections above; "vs A" is device time / A.
-
-| | A (current) | B (fixed order, RL-Kernel Triton) | C (B in a pinned aiter) | D (linear + separate Σx²) | E (aiter HIP, fixed split) |
+| | `aiter_config_table` (current) | `fixed_order` | `fixed_order_in_aiter_fork` | `separate_projection` | `aiter_hip` |
 |---|---|---|---|---|---|
-| Batch invariant, one software version | yes | yes | as B | yes | yes for split 1, 4, 8; no for 64 |
-| Bits independent of launch parameters | no; held by the table (7 parameters forced equal, 2 combinations excluded by tests only) | yes, 96 configs | as B | yes for the Σx² kernel; projection as gemm_a16w16 (`NUM_KSPLIT`, `kpack` fixed) | no exposed parameters; internal choices by M (`tile_n`, big-fuse launch) |
-| Bits equal across Triton 3.7.0 / 3.8.0 | no | yes | as B | not measured | not applicable (HIP); hipcc versions not measured |
-| post_mix max error vs fp32 reference | 3.6e-3 (bf16 `fn`) | 3.6e-3 | as B | 3.6e-3 | 2.4e-6 – 6.4e-6 (fp32 `fn`) |
-| layer_input mean error | 1.50e-3 | 1.50e-3 | as B | 1.50e-3 | 2.53e-3 |
-| mhc_pre time vs A | 1 | S = 4: 0.68–0.96; S = 16: 0.36–0.55 for M ≤ 1024, 1.07–1.48 for M ≥ 16384 | as B | 1.31–3.97 | 8×64: 0.38–0.97; 4×128: 0.61–0.97 |
-| mhc_head time vs A | 1 | S = 4: 0.04–0.15 | as B | — | 8×64: 0.03–0.14 |
-| Code and dependencies | aiter Triton kernels, not pinned by RL-Kernel | RL-Kernel only (Triton); no aiter | aiter fork + pin mechanism RL-Kernel does not have | aiter gemm_a16w16 + B's kernel | aiter HIP module (hipcc, CK headers, JIT); internal functions; image needs flydsl ≥ 0.2.4 for a normal `import aiter` |
-| Not done yet | — | autograd/backward wrapper (A uses aiter's PyTorch recompute), registry entry and tests, shapes other than C = 4096, gfx950; choosing S (part of the numerics) | as B, plus the pin | — | wrapper enforcing a contiguous residual, backward, head without the 20 wasted projection columns |
+| Batch invariant with one software version | yes | yes | same as `fixed_order` | yes | yes with 1, 4 or 8 K segments; no with 64 |
+| Bits independent of launch parameters | no; held by the tables (7 parameters forced equal, 2 combinations excluded only by tests) | yes (96 configs) | same as `fixed_order` | yes for the sum of squares; the projection keeps `gemm_a16w16`'s rules (`NUM_KSPLIT`, `kpack` fixed) | no parameters exposed; internal sizes chosen from M |
+| Same bits with Triton 3.7.0 and 3.8.0 | no | yes | same as `fixed_order` | not measured | not applicable (HIP); hipcc versions not measured |
+| Largest `post_mix` error against the fp32 reference | 3.6e-3 (weights rounded to bf16) | 3.6e-3 | same as `fixed_order` | 3.6e-3 | 2.4e-6 to 6.4e-6 (fp32 weights) |
+| Mean `layer_input` error | 1.50e-3 | 1.50e-3 | same as `fixed_order` | 1.50e-3 | 2.53e-3 |
+| mHC pre time / baseline | 1 | 4 segments: 0.68–0.96. 16 segments: 0.36–0.55 up to M = 1024, 1.07–1.48 from M = 16384 | same as `fixed_order` | 1.31–3.97 | 8 segments: 0.38–0.97. 4 segments: 0.61–0.97 |
+| mHC head time / baseline | 1 | 4 segments: 0.04–0.15 | same as `fixed_order` | — | 8 segments: 0.03–0.14 |
+| Where the code lives | aiter's Triton kernels, aiter not pinned by RL-Kernel | RL-Kernel only, Triton; no aiter | an aiter fork plus a pinning mechanism that RL-Kernel does not have yet | aiter `gemm_a16w16` plus the `fixed_order` kernel | aiter's HIP module (hipcc, composable_kernel headers, JIT); internal functions; a normal `import aiter` needs flydsl ≥ 0.2.4 |
+| Work still missing | — | backward pass (the baseline uses aiter's PyTorch recomputation), registry entry and tests, other hidden sizes than 4096, gfx950, choosing the number of K segments | as `fixed_order`, plus pinning aiter | — | wrapper that makes the residual contiguous, backward pass, mHC head without the 20 unused projection rows |
 
-Open questions that do not depend on the choice:
+Questions that stay open whichever approach is chosen:
 
-- projection precision: DeepSeek-V4's reference uses fp32 `fn`; A, B and D
-  round it to bf16, E keeps fp32 (RFC task 1 question, unchanged);
-- whether results must also match across Triton or ROCm versions (A does not;
-  B did for 3.7.0 vs 3.8.0).
+- the precision of the projection: the DeepSeek-V4 reference uses fp32 weights,
+  the Triton approaches round them to bf16, `aiter_hip` keeps fp32 (an open
+  question for the RFC author already);
+- whether results must also match across Triton or ROCm versions;
+  `aiter_config_table` does not, `fixed_order` did for Triton 3.7.0 and 3.8.0.
 
+## 8. How the problem was found
 
-## 8. How this was found
-
-From the local agent transcripts of the KLR work (`~/.claude/projects/-home-AMD-zitwang-dev-KLR/`)
+From the agent transcripts of the KLR work (`~/.claude/projects/-home-AMD-zitwang-dev-KLR/`)
 and the KLR analysis document `issue-81-zitian-wang-mhc-tasks-analysis.md`:
 
 | Date | What happened |
 |---|---|
-| 2026-10-29/30 | RFC evaluation: the mHC pre bit changes from M = 1024 on are attributed to aiter's K split (analysis doc `:254`, `:343`); the exact-input isolation ran with aiter's default config, where `NUM_KSPLIT`, `BLOCK_K` and `BLOCK_C` change together, so it could not separate them |
-| 2026-11-02 | first written suspicion that the sum-of-squares `tl.sum` tree follows `BLOCK_K` ("很可能", unverified) |
-| 2026-11-03 | per-M tuning measures that `BLOCK_K` changes mHC bits but not gemm_a16w16 bits; analysis doc `:628` keeps "很可能" |
-| 2026-11-04 | weekly report states the cause as split-K "连同 RMS"; the isolation script `measure_mhc_block_k_bit_source.py` is written but not run |
-| 2026-11-06 | job 68297426: `BLOCK_K` acts through the sum of squares only |
-| 2026-11-08 | jobs 68321538 / 68321539 (this document) |
+| 2026-10-29 and 30 | The RFC evaluation attributes the bit changes of mHC pre from `M = 1024` on to aiter's K split (analysis document lines 254 and 343). The test that isolates each sum ran with aiter's own configs, where `NUM_KSPLIT`, `BLOCK_K` and `BLOCK_C` change together, so it could not tell them apart. |
+| 2026-11-02 | First written suspicion that the order of the sum-of-squares `tl.sum` follows `BLOCK_K`; marked as unverified. |
+| 2026-11-03 | Tuning per `M` measures that `BLOCK_K` changes the bits of the mHC kernels but not those of `gemm_a16w16`; the analysis document (line 628) still says "probably". |
+| 2026-11-04 | The weekly report names the K split as the cause, with the sum of squares changing "along with it"; the script that would separate the two is written but not run. |
+| 2026-11-06 | Job 68297426: `BLOCK_K` changes the bits through the sum of squares only. |
+| 2026-11-08 | Jobs 68321538, 68321539, 68321583, 68321590 and 68322040 (this page). |
 
-## 9. Reproduction
+## 9. How to reproduce
 
-| What | Script | Job | Log |
+| Measurement | Script | Job | Result file under `/home/AMD/zitwang/dev/logs/` |
 |---|---|---|---|
-| bits per input kind and TTGIR layouts of aiter's configs | `benchmarks/operators/mhc/analyze_aiter_reductions.py` | 68321538 | `logs/mhc-bi-analysis-68321538-triton-{image,3.8.0-amd}.md` |
-| B / D: launch invariance, BI, error, device time, Triton digests | `benchmarks/operators/mhc/evaluate_mhc_candidates.py` | 68321539 | `logs/mhc-bi-candidates-68321539*.md` |
-| aiter HIP `mhc_pre` | `benchmarks/operators/mhc/probe_aiter_hip_mhc_pre.py` | 68321569 | `logs/mhc-hip-probe-68321569.md` |
-| `BLOCK_K` source (first isolation) | KLR `scripts/measure_mhc_block_k_bit_source.py` | 68297426 | `logs/mhc-block-k-bit-source-68297426.md` |
+| Bits per input kind and Triton layouts of aiter's configs | `benchmarks/operators/mhc/analyze_aiter_reductions.py` | 68321538 | `mhc-bi-analysis-68321538-triton-image.md`, `…-triton-3.8.0-amd.md` |
+| Which sum changes between Triton 3.7.0 and 3.8.0 | `analyze_aiter_reductions.py --digest` | 68321583 | `mhc-bi-triton-versions-68321583-compare.md` |
+| `fixed_order` and `separate_projection`: launch parameters, batch invariance, error, device time, digests across Triton versions | `benchmarks/operators/mhc/evaluate_mhc_candidates.py` | 68321539, 68321590 | `mhc-bi-candidates-68321539.md`, `mhc-bi-candidates-68321590.md` and their `-digest-*` files |
+| `aiter_hip` | `benchmarks/operators/mhc/probe_aiter_hip_mhc_pre.py` | 68322040 | `mhc-hip-probe-68322040.md`, `mhc-hip-probe-68322040-baseline.md` |
+| First isolation of `BLOCK_K` | KLR `scripts/measure_mhc_block_k_bit_source.py` | 68297426 | `mhc-block-k-bit-source-68297426.md` |
 
-Logs are under `/home/AMD/zitwang/dev/logs/`; job scripts
-`run-mhc-bi-analysis.sbatch`, `run-mhc-bi-candidates.sbatch`,
-`run-mhc-hip-probe.sbatch` in `/home/AMD/zitwang/dev/`.
+The job scripts are `run-mhc-bi-analysis.sbatch`, `run-mhc-bi-candidates.sbatch`
+and `run-mhc-bi-triton-versions.sbatch` in `/home/AMD/zitwang/dev/`. The
+`aiter_hip` measurement ran on a copy of the aiter checkout without `.git`, with
+`3rdparty/composable_kernel` fetched at aiter's submodule commit `af9e1d1`, so
+that aiter's JIT build did not write into `/home/AMD/zitwang/dev/aiter`; that
+copy has been deleted.

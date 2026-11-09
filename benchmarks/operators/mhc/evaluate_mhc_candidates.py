@@ -1,31 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Evaluate the candidates for batch-invariant mHC pre and head on ROCm.
+"""Evaluate the approaches to batch-invariant mHC pre and head on ROCm.
 
-Candidates (docs/operators/mhc-reduction-order.md):
+Approaches (docs/operators/mhc-reduction-order.md):
 
-- A: the current ops, aiter's kernels with launch configs whose bits are equal
-  for every M (``AiterMHCPreOp`` / ``AiterMHCHeadOp``); baseline of every table;
-- B: ``fixed_order_mhc_pre`` / ``fixed_order_mhc_head``, Triton kernels with every
-  reduction order written in the kernel; ``S`` is the number of K splits, a
-  constant of the kernel (K = 16384: the default rule gives S = 4);
-- D: ``fixed_order_mhc_pre(projection="aiter_linear")``: projection by aiter's
-  gemm_a16w16 with the batch-invariant linear's config, sum of squares by B's
-  kernel (pre only);
-- aiter default: the aiter ops with their own config choice (not batch
-  invariant), for reference.
+- ``aiter_config_table``: the current ops, aiter's Triton kernels with launch
+  configs whose bits are equal for every M (``AiterMHCPreOp`` /
+  ``AiterMHCHeadOp``); the baseline of every table;
+- ``fixed_order``: ``fixed_order_mhc_pre`` / ``fixed_order_mhc_head``, Triton
+  kernels with every reduction order written in the kernel. The number of K
+  splits is part of the arithmetic (for K = 16384 the default rule gives 4);
+- ``separate_projection``: ``fixed_order_mhc_pre(projection="aiter_linear")``,
+  the projection by aiter's gemm_a16w16 with the batch-invariant linear's
+  config and the sum of squares by the ``fixed_order`` kernel (pre only);
+- ``aiter_own_config``: the aiter ops with aiter's own config choice, which is
+  not batch invariant, for reference.
 
 Sections, each written to the report as soon as it is done:
 
-1. launch-parameter invariance of B: every launch parameter changed one at a
-   time (and a few together) against B's default config, all outputs compared
+1. launch-parameter invariance of ``fixed_order``: every launch parameter changed
+   one at a time (and a few together) against its default config, all outputs compared
    bit for bit at several M;
-2. batch invariance of A, B and D with rl_engine/validation/common/batch_invariance.py
+2. batch invariance of every approach with rl_engine/validation/common/batch_invariance.py
    (a row alone vs in batches, chunking/reordering/padding, strides, repeated runs);
-   B also with a launch config that changes with M;
+   ``fixed_order`` also with a launch config that changes with M;
 3. error against the fp32 PyTorch reference (``forward_fp32``), same inputs for all;
 4. device time per M from GPU events around a CUDA graph of ITERS calls; median
-   and min-max over TRIALS replays; for B and D the fastest of a set of launch
+   and min-max over TRIALS replays; for ``fixed_order`` and ``separate_projection``
+   the fastest of a set of launch
    configs that section 1 shows give the same bits;
 5. ``--digest``/``--compare``: SHA-256 of the outputs of fixed configs, to compare
    two Triton versions.
@@ -71,6 +73,7 @@ INVARIANCE_M = [1, 17, 1024, 4096]
 BI_M = [1, 8, 16, 17, 59, 64, 128, 256, 1024, 2048, 4096, 8192, 16384]
 PERF_M = [1, 16, 64, 256, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
 SPLITS = [1, 4, 16]
+BASELINE = "aiter_config_table"
 
 PRE_LAUNCH_VARIANTS = [
     {"BLOCK_M": 16},
@@ -141,20 +144,20 @@ def variants(pre_w, head_w):
         return [post.reshape(post.shape[0], N), comb.reshape(comb.shape[0], N, N), li]
 
     table = {
-        "aiter default": (
+        "aiter_own_config": (
             lambda r: flat_pre(mhc_pre_dsv4(r, *pre_w, sinkhorn_repeat=20)),
             lambda r: [mhc_head_dsv4(r, *head_w)],
         ),
-        "A": (lambda r: flat_pre(a_pre(r, *pre_w)), lambda r: [a_head(r, *head_w)]),
+        BASELINE: (lambda r: flat_pre(a_pre(r, *pre_w)), lambda r: [a_head(r, *head_w)]),
     }
     for s in SPLITS:
-        table[f"B S={s}"] = (
+        table[f"fixed_order, {s} K splits"] = (
             lambda r, s=s, cfg=None: flat_pre(
                 fixed_order_mhc_pre(r, *pre_w, k_splits=s, config=cfg)
             ),
             lambda r, s=s, cfg=None: [fixed_order_mhc_head(r, *head_w, k_splits=s, config=cfg)],
         )
-    table["D S=4"] = (
+    table["separate_projection, 4 K splits"] = (
         lambda r, cfg=None: flat_pre(
             fixed_order_mhc_pre(r, *pre_w, k_splits=4, config=cfg, projection="aiter_linear")
         ),
@@ -172,14 +175,14 @@ def _ndiff(a, b):
     return int((_bits(a) != _bits(b)).sum())
 
 
-# --- 1. launch-parameter invariance of B --------------------------------------------------------
+# --- 1. launch-parameter invariance of fixed_order ----------------------------------------------
 
 
 def section_launch_invariance(pre_w, head_w):
     lines = [
-        "## 1. Launch-parameter invariance of B",
+        "## 1. Launch-parameter invariance of fixed_order",
         "",
-        "Each row changes the listed launch parameters of B's default config "
+        "Each row changes the listed launch parameters of fixed_order's default config "
         f"(pre `{DEFAULT_PRE_CONFIG}`, head `{DEFAULT_HEAD_CONFIG}`) and compares every "
         f"output bit for bit with the default config, random inputs, M = {INVARIANCE_M}.",
         "",
@@ -228,7 +231,7 @@ def _case(name, outputs, fn):
 
 
 def _m_dependent_config(m):
-    """A launch config that changes with M, to show that B does not depend on it."""
+    """A launch config that changes with M, to show that fixed_order does not depend on it."""
     if m < 64:
         return {"BLOCK_M": 16, "num_warps": 8, "APPLY_BLOCK_C": 256, "SINKHORN_BLOCK_M": 1}
     return {"BLOCK_M": 64, "num_warps": 4, "APPLY_BLOCK_C": 64, "SINKHORN_BLOCK_M": 64}
@@ -249,14 +252,15 @@ def section_batch_invariance(table, pre_w, head_w):
     ]
     pre_out, head_out = ["post_mix", "comb_mix", "layer_input"], ["output"]
     runners = []
-    for name in ("A", "B S=1", "B S=4", "B S=16", "D S=4"):
+    names = [BASELINE, *(f"fixed_order, {s} K splits" for s in SPLITS)]
+    for name in names + ["separate_projection, 4 K splits"]:
         pre, head = table[name]
         runners.append((name, "pre", pre_out, pre))
         if head is not None:
             runners.append((name, "head", head_out, head))
     runners.append(
         (
-            "B S=4, config by M",
+            "fixed_order, 4 K splits, launch config by M",
             "pre",
             pre_out,
             lambda r: [
@@ -269,7 +273,7 @@ def section_batch_invariance(table, pre_w, head_w):
     )
     runners.append(
         (
-            "B S=4, config by M",
+            "fixed_order, 4 K splits, launch config by M",
             "head",
             head_out,
             lambda r: [
@@ -390,58 +394,59 @@ def section_perf(pre_w, head_w):
     b_configs = [dict(p, **a) for p, a in itertools.product(PERF_PRENORM, PERF_APPLY)]
     lines = []
     for op in ("pre", "head"):
-        names = ["aiter default", "A"] + [f"B S={s}" for s in SPLITS]
-        names += ["D S=4"] if op == "pre" else []
+        names = ["aiter_own_config", BASELINE] + [f"fixed_order, {s} K splits" for s in SPLITS]
+        names += ["separate_projection, 4 K splits"] if op == "pre" else []
         lines += [
             f"## 4{'a' if op == 'pre' else 'b'}. Device time, mhc_{op}",
             "",
             f"Forward of mhc_{op}, DeepSeek-V4-Flash shapes (n=4, C=4096, bf16 residual), "
             "ms per call from GPU events around a CUDA graph; median (min-max) over replays. "
-            "Baseline: A (the current op). Ratio columns: variant time / A time. For B and D "
+            f"Baseline: {BASELINE} (the current op). Ratio columns: variant time / baseline time. "
+            "For fixed_order and separate_projection "
             f"the fastest of {len(b_configs)} launch configs (BLOCK_M x num_warps x apply tile), "
             "which give the same bits (section 1).",
             "",
             "| M | " + " | ".join(f"{n} (ms)" for n in names) + " | "
-            + " | ".join(f"{n} / A (ratio)" for n in names if n != "A") + " |",
+            + " | ".join(f"{n} / {BASELINE} (ratio)" for n in names if n != BASELINE) + " |",
             "|---|" + "---|" * (2 * len(names) - 1),
         ]
         for m in PERF_M:
             r = residual(m, seed=3)
             results = {}
             if op == "pre":
-                results["aiter default"] = _measure(
+                results["aiter_own_config"] = _measure(
                     lambda r=r: mhc_pre_dsv4(r, *pre_w, sinkhorn_repeat=20)
                 )
-                results["A"] = _measure(lambda r=r: a_pre(r, *pre_w))
+                results[BASELINE] = _measure(lambda r=r: a_pre(r, *pre_w))
                 for s in SPLITS:
-                    results[f"B S={s}"], _ = _best(
+                    results[f"fixed_order, {s} K splits"], _ = _best(
                         lambda cfg, s=s, r=r: lambda: fixed_order_mhc_pre(
                             r, *pre_w, k_splits=s, config=cfg
                         ),
                         b_configs,
                     )
-                results["D S=4"], _ = _best(
+                results["separate_projection, 4 K splits"], _ = _best(
                     lambda cfg, r=r: lambda: fixed_order_mhc_pre(
                         r, *pre_w, k_splits=4, config=cfg, projection="aiter_linear"
                     ),
                     b_configs,
                 )
             else:
-                results["aiter default"] = _measure(lambda r=r: mhc_head_dsv4(r, *head_w))
-                results["A"] = _measure(lambda r=r: a_head(r, *head_w))
+                results["aiter_own_config"] = _measure(lambda r=r: mhc_head_dsv4(r, *head_w))
+                results[BASELINE] = _measure(lambda r=r: a_head(r, *head_w))
                 for s in SPLITS:
-                    results[f"B S={s}"], _ = _best(
+                    results[f"fixed_order, {s} K splits"], _ = _best(
                         lambda cfg, s=s, r=r: lambda: fixed_order_mhc_head(
                             r, *head_w, k_splits=s, config=cfg
                         ),
                         b_configs,
                     )
-            base = results["A"]
+            base = results[BASELINE]
             lines.append(
                 f"| {m} | "
                 + " | ".join(_cell(results[n]) for n in names)
                 + " | "
-                + " | ".join(_ratio(results[n], base) for n in names if n != "A")
+                + " | ".join(_ratio(results[n], base) for n in names if n != BASELINE)
                 + " |"
             )
             del r
@@ -461,12 +466,14 @@ def digests(pre_w, head_w):
     split4 = {"NUM_KSPLIT": 4, "BLOCK_M": 16, "BLOCK_K": 128, "BLOCK_C": 64, "num_warps": 4,
               "num_stages": 1, "waves_per_eu": 0}
     runs = {
-        "A pre (table class, NUM_KSPLIT=4)": lambda r: list(
+        "aiter_config_table pre (NUM_KSPLIT=4 class)": lambda r: list(
             mhc_pre_dsv4(r, *pre_w, sinkhorn_repeat=20, config=dict(split4))
         ),
-        "A head (aiter config)": lambda r: [launch_mhc_head(r, *head_w, aiter_head_config())],
-        "B pre S=4": lambda r: list(fixed_order_mhc_pre(r, *pre_w, k_splits=4)),
-        "B head S=4": lambda r: [fixed_order_mhc_head(r, *head_w, k_splits=4)],
+        "aiter_config_table head (aiter's config)": lambda r: [
+            launch_mhc_head(r, *head_w, aiter_head_config())
+        ],
+        "fixed_order pre, 4 K splits": lambda r: list(fixed_order_mhc_pre(r, *pre_w, k_splits=4)),
+        "fixed_order head, 4 K splits": lambda r: [fixed_order_mhc_head(r, *head_w, k_splits=4)],
     }
     result = {}
     for name, run in runs.items():
@@ -481,7 +488,7 @@ def digests(pre_w, head_w):
 
 def header():
     return [
-        "# Batch-invariant mHC candidates on ROCm",
+        "# Batch-invariant mHC approaches on ROCm",
         "",
         f"Host `{socket.gethostname()}`, {torch.cuda.get_device_name()}, "
         f"torch {torch.__version__}, triton {triton.__version__}. "
