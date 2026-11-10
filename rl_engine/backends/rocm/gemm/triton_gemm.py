@@ -37,8 +37,10 @@ from rl_engine.utils.logger import logger
 BLOCK_K = 64
 DOT_OPTIONS = {"matrix_instr_nonkdim": 16, "kpack": 1}
 
-# (largest M, launch config). The configs only change how output tiles are
-# grouped into workgroups, not the bits.
+# (largest M, launch config): the op uses the first entry whose largest M is at
+# least its M. The configs only change how output tiles are grouped into
+# workgroups, not the bits. Not measured yet: taken from aiter's per-M table for
+# the lm_head on gfx942, with the K tile set to BLOCK_K.
 CONFIGS = (
     (
         16,

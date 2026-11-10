@@ -58,9 +58,9 @@ What the copy changes in aiter's kernel (module docstring of `triton_gemm.py`):
 - **Dynamic shape.** M and N are runtime arguments that Triton does not
   specialize; aiter's compile-time `EVEN_MN` switch is removed (always the masked
   path), and `EVEN_K` depends on K only. A new M compiles nothing.
-- **Launch config.** Chosen from `CONFIGS` by M (four buckets: M ≤ 16, ≤ 128,
-  ≤ 1024, larger). The configs only group output tiles into workgroups; they do
-  not change the bits. Each compiles once per process;
+- **Launch config.** `CONFIGS` holds four launch configs, one per range of M
+  (M ≤ 16, M ≤ 128, M ≤ 1024, larger), and the op uses the one for its M. The
+  configs only group output tiles into workgroups; they do not change the bits. Each compiles once per process;
   `TritonBatchInvariantLinearOp.warmup(weight)` compiles all of them.
 - Activations, `skip_reduce` and aiter's persistent and gluon paths are removed.
 
@@ -122,13 +122,14 @@ not tile multiples, the lm_head shape, bf16 and fp32 output, and bias: a row alo
 and in batches of M = 1 to 16384 (8192 for lm_head, including the WS1 manifest's
 8 and 59), chunking, reordering and padding, other input strides, repeated runs,
 the fp32 reference, the input gradient, empty batches and unsupported inputs.
-M includes the largest M of every `CONFIGS` bucket and the M after it, and every
+M includes the largest M of every range in `CONFIGS` and the M after it, and every
 entry of `CONFIGS` is also compared with the first one directly.
 `test_rocm_dynamic_shape.py` checks that unseen M values compile nothing after
 `warmup`.
 
 ## Known Limitations
 
-- The `CONFIGS` buckets are a first choice for the lm_head shape on gfx942; they
-  are to be set from the device-time measurement.
+- The four configs in `CONFIGS` and their M ranges are not measured yet: they
+  were taken from aiter's per-M table for the lm_head on gfx942, with the K tile
+  set to 64. They are to be set from the device-time measurement.
 - No CUDA kernel.

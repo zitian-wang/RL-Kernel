@@ -43,8 +43,9 @@ from rl_engine.validation.common.batch_invariance import (
 from tests.helpers.contract_tolerance import assert_matches_fp32_reference
 
 _LM_HEAD_TABLE = "GEMM-A16W16-N=129280-K=4096.json"
-_BUCKET_EDGES = {e for m_max, _ in triton_gemm.CONFIGS if m_max for e in (m_max, m_max + 1)}
-_M_VALUES = sorted({1, 8, 16, 17, 59, 64, 256, 1024, 2048, 4096, 8192, 16384} | _BUCKET_EDGES)
+# The largest M of every range in CONFIGS and the M after it.
+_RANGE_EDGES = {e for m_max, _ in triton_gemm.CONFIGS if m_max for e in (m_max, m_max + 1)}
+_M_VALUES = sorted({1, 8, 16, 17, 59, 64, 256, 1024, 2048, 4096, 8192, 16384} | _RANGE_EDGES)
 
 # name -> (N, K, output dtype, with bias)
 _SHAPES = {

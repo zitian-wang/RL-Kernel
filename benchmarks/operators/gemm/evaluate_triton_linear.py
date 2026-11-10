@@ -16,7 +16,8 @@ Sections, each written to the report as soon as it is done:
 3. dynamic shape: compiled variants of the kernel after ``warmup`` and after many unseen M;
 4. error of baseline and ours against an fp32 PyTorch linear;
 5. lm_head device time per M from GPU events: baseline, ours, and every
-   candidate config, to choose the CONFIGS buckets; ratios against the baseline;
+   candidate config, to choose the configs and M ranges of CONFIGS; ratios against the
+   baseline;
 6. ``--digest``/``--compare``: SHA-256 of the outputs of ours, to compare two
    Triton versions.
 
