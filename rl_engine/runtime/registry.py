@@ -163,13 +163,13 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_MHC_PRE = "rl_engine.reference.mhc.mhc.NativeMHCPreOp"
     PYTORCH_NATIVE_MHC_POST = "rl_engine.reference.mhc.mhc.NativeMHCPostOp"
     PYTORCH_NATIVE_MHC_HEAD = "rl_engine.reference.mhc.mhc.NativeMHCHeadOp"
-    # DeepSeek-V4 mHC on aiter (ROCm)
-    ROCM_AITER_MHC_PRE = "rl_engine.backends.rocm.mhc.aiter_mhc.AiterMHCPreOp"
-    ROCM_AITER_MHC_POST = "rl_engine.backends.rocm.mhc.aiter_mhc.AiterMHCPostOp"
-    ROCM_AITER_MHC_HEAD = "rl_engine.backends.rocm.mhc.aiter_mhc.AiterMHCHeadOp"
-    # Batch-invariant linear y = x @ w^T + bias on aiter gemm_a16w16 (ROCm)
-    ROCM_AITER_BATCH_INVARIANT_LINEAR = (
-        "rl_engine.backends.rocm.gemm.aiter_gemm.AiterBatchInvariantLinearOp"
+    # DeepSeek-V4 mHC on ROCm: Triton kernels copied from aiter, batch invariant by construction
+    ROCM_TRITON_MHC_PRE = "rl_engine.backends.rocm.mhc.triton_mhc.TritonMHCPreOp"
+    ROCM_TRITON_MHC_POST = "rl_engine.backends.rocm.mhc.triton_mhc.TritonMHCPostOp"
+    ROCM_TRITON_MHC_HEAD = "rl_engine.backends.rocm.mhc.triton_mhc.TritonMHCHeadOp"
+    # Batch-invariant linear y = x @ w^T + bias on ROCm: aiter's gemm_a16w16 kernel, copied
+    ROCM_TRITON_BATCH_INVARIANT_LINEAR = (
+        "rl_engine.backends.rocm.gemm.triton_gemm.TritonBatchInvariantLinearOp"
     )
 
     # Generic fallback
@@ -372,13 +372,13 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
         ),
         OperatorBackendDescriptor(
             semantic_op="batch_invariant_linear",
-            backend_id="rlkernel.rocm.aiter_gemm_a16w16.batch_invariant.v1",
+            backend_id="rlkernel.rocm.triton_gemm_a16w16.batch_invariant.v1",
             supported_targets=frozenset({"rollout", "training"}),
             supported_devices=frozenset({"rocm"}),
             supported_dtypes=frozenset({"bfloat16"}),
             supported_topologies={"*": "*"},
             determinism_or_alignment_properties={
-                "algorithm": "aiter_gemm_a16w16_whole_k_per_shape_config",
+                "algorithm": "whole_k_fixed_k_tile",
                 "batch_invariant": True,
                 "deterministic": True,
                 "backward": "triton_det_gemm_fp32",
@@ -386,70 +386,76 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
             },
             lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
             implementation_class_or_factory=(
-                "rl_engine.backends.rocm.gemm.aiter_gemm.AiterBatchInvariantLinearOp"
+                "rl_engine.backends.rocm.gemm.triton_gemm.TritonBatchInvariantLinearOp"
             ),
             fallback_policy=OperatorFallbackPolicy.ERROR,
-            version_or_build_fingerprint="AiterBatchInvariantLinearOp-launch-config-tables-v1",
+            version_or_build_fingerprint="TritonBatchInvariantLinearOp-whole-k-block-k-64-v1",
         ),
         OperatorBackendDescriptor(
             semantic_op="mhc_pre",
-            backend_id="rlkernel.rocm.aiter_mhc_pre_dsv4.batch_invariant.v1",
+            backend_id="rlkernel.rocm.triton_mhc_pre_dsv4.batch_invariant.v1",
             supported_targets=frozenset({"rollout", "training"}),
             supported_devices=frozenset({"rocm"}),
             supported_dtypes=frozenset({"bfloat16"}),
             supported_topologies={"*": "*"},
             determinism_or_alignment_properties={
-                "algorithm": "aiter_mhc_pre_dsv4_fixed_k_split_per_shape_config",
+                "algorithm": "four_k_splits_written_reduction_order_fp32_projection",
                 "batch_invariant": True,
                 "deterministic": True,
-                # aiter recomputes backward in PyTorch.
+                # Backward recomputes the formula in PyTorch, as aiter does.
                 "backward_batch_invariant": False,
                 "strict_observable": True,
             },
             lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
-            implementation_class_or_factory="rl_engine.backends.rocm.mhc.aiter_mhc.AiterMHCPreOp",
+            implementation_class_or_factory=(
+                "rl_engine.backends.rocm.mhc.triton_mhc.TritonMHCPreOp"
+            ),
             fallback_policy=OperatorFallbackPolicy.ERROR,
-            version_or_build_fingerprint="AiterMHCPreOp-launch-config-tables-v1",
+            version_or_build_fingerprint="TritonMHCPreOp-four-k-splits-v1",
         ),
         OperatorBackendDescriptor(
             semantic_op="mhc_post",
-            backend_id="rlkernel.rocm.aiter_mhc_post_dsv4.batch_invariant.v1",
+            backend_id="rlkernel.rocm.triton_mhc_post_dsv4.batch_invariant.v1",
             supported_targets=frozenset({"rollout", "training"}),
             supported_devices=frozenset({"rocm"}),
             supported_dtypes=frozenset({"bfloat16"}),
             supported_topologies={"*": "*"},
             determinism_or_alignment_properties={
-                "algorithm": "aiter_mhc_post_dsv4_rowwise",
+                "algorithm": "rowwise_stream_order",
                 "batch_invariant": True,
                 "deterministic": True,
-                # aiter recomputes backward in PyTorch.
+                # Backward recomputes the formula in PyTorch, as aiter does.
                 "backward_batch_invariant": False,
                 "strict_observable": True,
             },
             lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
-            implementation_class_or_factory="rl_engine.backends.rocm.mhc.aiter_mhc.AiterMHCPostOp",
+            implementation_class_or_factory=(
+                "rl_engine.backends.rocm.mhc.triton_mhc.TritonMHCPostOp"
+            ),
             fallback_policy=OperatorFallbackPolicy.ERROR,
-            version_or_build_fingerprint="AiterMHCPostOp-aiter-config-v1",
+            version_or_build_fingerprint="TritonMHCPostOp-v1",
         ),
         OperatorBackendDescriptor(
             semantic_op="mhc_head",
-            backend_id="rlkernel.rocm.aiter_mhc_head_dsv4.batch_invariant.v1",
+            backend_id="rlkernel.rocm.triton_mhc_head_dsv4.batch_invariant.v1",
             supported_targets=frozenset({"rollout", "training"}),
             supported_devices=frozenset({"rocm"}),
             supported_dtypes=frozenset({"bfloat16"}),
             supported_topologies={"*": "*"},
             determinism_or_alignment_properties={
-                "algorithm": "aiter_mhc_head_dsv4_fixed_tiles_per_shape_config",
+                "algorithm": "four_k_splits_written_reduction_order_fp32_projection",
                 "batch_invariant": True,
                 "deterministic": True,
-                # aiter recomputes backward in PyTorch.
+                # Backward recomputes the formula in PyTorch, as aiter does.
                 "backward_batch_invariant": False,
                 "strict_observable": True,
             },
             lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
-            implementation_class_or_factory="rl_engine.backends.rocm.mhc.aiter_mhc.AiterMHCHeadOp",
+            implementation_class_or_factory=(
+                "rl_engine.backends.rocm.mhc.triton_mhc.TritonMHCHeadOp"
+            ),
             fallback_policy=OperatorFallbackPolicy.ERROR,
-            version_or_build_fingerprint="AiterMHCHeadOp-launch-config-tables-v1",
+            version_or_build_fingerprint="TritonMHCHeadOp-four-k-splits-v1",
         ),
     )
 
@@ -757,12 +763,12 @@ class KernelRegistry:
                 ],
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
-                # aiter only: a missing aiter must fail, not fall back to a
-                # GEMM whose bits change with the batch.
-                "batch_invariant_linear": [OpBackend.ROCM_AITER_BATCH_INVARIANT_LINEAR],
-                "mhc_pre": [OpBackend.ROCM_AITER_MHC_PRE],
-                "mhc_post": [OpBackend.ROCM_AITER_MHC_POST],
-                "mhc_head": [OpBackend.ROCM_AITER_MHC_HEAD],
+                # No fallback: a failing op must raise, not fall back to one
+                # whose bits change with the batch.
+                "batch_invariant_linear": [OpBackend.ROCM_TRITON_BATCH_INVARIANT_LINEAR],
+                "mhc_pre": [OpBackend.ROCM_TRITON_MHC_PRE],
+                "mhc_post": [OpBackend.ROCM_TRITON_MHC_POST],
+                "mhc_head": [OpBackend.ROCM_TRITON_MHC_HEAD],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 "silu": [OpBackend.TRITON_SILU, OpBackend.PYTORCH_NATIVE_SILU],

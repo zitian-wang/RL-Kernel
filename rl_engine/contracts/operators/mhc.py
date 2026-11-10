@@ -2,37 +2,46 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """DeepSeek-V4 mHC contract: mHC pre, mHC post and mHC head (DSV4 RFC tasks 1-4, 8).
 
-Records the arithmetic of the ROCm backend, aiter ``326cffa``
-(``mhc_pre_dsv4``, ``mhc_post_dsv4``, ``mhc_head_dsv4``), as measured in
-tests/backends/rocm/test_rocm_mhc_*.py, and where the fp32 PyTorch reference
-(rl_engine/reference/mhc/mhc.py, DeepSeek-V4-Flash-0731 ``inference/model.py``)
-differs. ``n`` residual streams of hidden size ``C`` per token; leading
-dimensions are flattened into the token count M; K = n * C.
+Records the arithmetic of the ROCm backend, RL-Kernel's Triton kernels in
+rl_engine/backends/rocm/mhc/triton_mhc.py (copied from aiter ``326cffa``,
+``mhc_pre_dsv4``, ``mhc_post_dsv4``, ``mhc_head_dsv4``, and made batch invariant
+by construction), as measured in tests/backends/rocm/test_rocm_mhc_*.py, and
+where the fp32 PyTorch reference (rl_engine/reference/mhc/mhc.py,
+DeepSeek-V4-Flash-0731 ``inference/model.py``) differs. ``n`` residual streams
+of hidden size ``C`` per token; leading dimensions are flattened into the token
+count M; K = n * C.
 
 mHC pre, per token, x = FP32(flatten(residual)) [K]::
 
-    r      = rsqrt(mean(x^2) + rms_eps)                FP32
-    mixes  = (x @ BF16(fn)^T) * r                      BF16 x BF16, FP32 accumulation
-    pre    = sigmoid(mixes[:n] * scale[0] + base[:n]) + hc_pre_eps
-    post   = hc_post_mult_value * sigmoid(mixes[n:2n] * scale[1] + base[n:2n])
-    comb   = sinkhorn(mixes[2n:] * scale[2] + base[2n:], sinkhorn_repeat)  [n, n]
-    layer_input = BF16(fma(pre2, x2, pre0 * x0) + fma(pre3, x3, pre1 * x1))
+    K is cut into NUM_KSPLIT = 4 segments; per segment s:
+      sq[s]  = pairwise sum over 128 columns of the element-wise fma(x, x, .)
+               accumulated over the K tiles of 128 of the segment
+      acc[s] = x[s] @ fn[:, s]^T                 FP32 x FP32 MFMA (ieee)
+    r      = 1 / sqrt((((sq[0] + sq[1]) + sq[2]) + sq[3]) / K + rms_eps)
+    acc    = ((acc[0] + acc[1]) + acc[2]) + acc[3]
+    pre    = sigmoid(r * scale[0] * acc[:n] + base[:n]) + hc_pre_eps
+    post   = hc_post_mult_value * sigmoid(r * scale[1] * acc[n:2n] + base[n:2n])
+    comb   = sinkhorn(r * scale[2] * acc[2n:] + base[2n:], sinkhorn_repeat)  [n, n]
+    layer_input = BF16(fma(pre3, x3, fma(pre2, x2, fma(pre1, x1, pre0 * x0))))
 
 sinkhorn is DeepSeek-V4's asymmetric form: the first round takes a row softmax,
 adds hc_sinkhorn_eps, then divides each column by (column sum + eps); each
-further round divides rows, then columns, by (sum + eps).
+further round divides rows, then columns, by (sum + eps). Row and column sums
+are pairwise: (p0 + p1) + (p2 + p3).
 
 mHC post, per token and destination stream j::
 
-    out[j] = BF16(post[j] * y + sum_h comb[h, j] * residual[h])   FP32
+    out[j] = BF16(post[j] * y + comb[0, j] * residual[0] + ... + comb[n-1, j] * residual[n-1])
 
-``comb`` is indexed [source stream, destination stream]; the old residual enters
-once, through ``comb``.
+added in source-stream order in FP32. ``comb`` is indexed [source stream,
+destination stream]; the old residual enters once, through ``comb``.
 
-mHC head, per token, with ``fn`` [n, K] and ``scale`` [1]::
+mHC head, per token, with ``fn`` [n, K] and ``scale`` [1]: the K segments, the
+sum of squares and the projection as in mHC pre, then::
 
-    w   = sigmoid((x @ BF16(fn)^T) * r * scale + base) + hc_pre_eps
-    out = BF16(sum_i w[i] * residual[i])                           FP32
+    r   = rsqrt(sum of squares / K + rms_eps)
+    w   = sigmoid(acc * r * scale + base) + hc_pre_eps
+    out = BF16(fma(w3, x3, fma(w2, x2, fma(w1, x1, w0 * x0))))
 """
 
 from __future__ import annotations
@@ -41,7 +50,8 @@ import copy
 
 import torch
 
-PROFILE = "dsv4-mhc-aiter-326cffa-v1"
+PROFILE = "dsv4-mhc-rocm-triton-v1"
+# The aiter commit the ROCm kernels were copied from.
 AITER_COMMIT = "326cffa"
 
 HC_MULT = 4
@@ -57,32 +67,31 @@ HC_POST_MULT_VALUE = 2.0
 SINKHORN_REPEAT = 20
 
 RMS_FORM = "rsqrt(mean(x^2) + rms_eps) over K = n * C, fp32"
-PROJECTION = "fn rounded to bf16; bf16 x bf16 with fp32 accumulation"
+PROJECTION = "fp32 fn; fp32 x fp32 MFMA (ieee), 4 K segments added in segment order"
 REFERENCE_PROJECTION = "fp32 x fp32"
-SINKHORN = "dsv4_asymmetric"
-STREAM_SUM = "fma(w2, x2, w0 * x0) + fma(w3, x3, w1 * x1) in fp32, one cast to bf16"
+SUM_OF_SQUARES = (
+    "per K segment: element-wise fma over K tiles of 128, then pairwise over the 128 "
+    "columns; 4 K segments added in segment order"
+)
+SINKHORN = "dsv4_asymmetric, pairwise row and column sums"
+STREAM_SUM = "fma(w3, x3, fma(w2, x2, fma(w1, x1, w0 * x0))) in fp32, one cast to bf16"
 
-# Launch-config parameters that change the output bits, measured on MI325X with
-# Triton 3.7 (docs/operators/mhc.md). PRE_BIT_PARAMS and HEAD_BIT_PARAMS equal
-# the constants of the same name in rl_engine/backends/rocm/mhc/aiter_mhc.py.
-PRE_BIT_PARAMS = ("NUM_KSPLIT", "BLOCK_K", "kpack")
-PRE_BIT_COMBINATIONS = ("BLOCK_C=256", "BLOCK_M=16 with num_warps=8")
-HEAD_BIT_PARAMS = ("BLOCK_M", "BLOCK_K", "BLOCK_C", "num_warps", "kpack")
+# The constants that fix the reduction order, equal to those of
+# rl_engine/backends/rocm/mhc/triton_mhc.py. No launch parameter changes the bits.
+ARITHMETIC_CONSTANTS = {"NUM_KSPLIT": 4, "BLOCK_K": 128, "matrix_instr_nonkdim": 16, "kpack": 1}
 
 BATCH_INVARIANCE = {
     "forward": True,
     "backward": False,
     "validated_on": "gfx942",
     "validated_shape": "DeepSeek-V4-Flash n=4, C=4096",
-    "launch_configs": "shipped gfx942 tables (configs/gfx942/mhc_pre, configs/gfx942/mhc_head)",
-    "backward_implementation": "aiter PyTorch recompute",
+    "launch_configs": "one config per op for every M; the bits do not depend on it",
+    "backward_implementation": "PyTorch recompute (as aiter), fp32 fn",
 }
 
 OPEN_ITEMS = (
     "RMS form: the RFC states 1 / (sqrt(mean(x^2)) + eps); aiter and the DeepSeek-V4 "
     "reference use rsqrt(mean(x^2) + eps).",
-    "Projection precision: aiter rounds fn to bf16; the DeepSeek-V4 reference projects "
-    "with fp32 fn.",
 )
 
 _SHAPES = {
@@ -114,6 +123,7 @@ _SHAPES = {
 _ARITHMETIC = {
     "mhc_pre": {
         "rms_form": RMS_FORM,
+        "sum_of_squares": SUM_OF_SQUARES,
         "projection": PROJECTION,
         "reference_projection": REFERENCE_PROJECTION,
         "pre_weights": "sigmoid(.) + hc_pre_eps",
@@ -121,24 +131,23 @@ _ARITHMETIC = {
         "sinkhorn": SINKHORN,
         "stream_sum": STREAM_SUM,
         "downcast_points": ["layer_input"],
-        "bit_params": list(PRE_BIT_PARAMS),
-        "bit_combinations": list(PRE_BIT_COMBINATIONS),
+        "arithmetic_constants": dict(ARITHMETIC_CONSTANTS),
     },
     "mhc_post": {
         "formula": "out[j] = post[j] * y + sum_h comb[h, j] * residual[h]",
-        "accumulation": "fp32",
+        "accumulation": "fp32, source streams in order",
         "residual_terms": "once, through comb",
         "downcast_points": ["out"],
-        "launch_config": "aiter's own, independent of M",
     },
     "mhc_head": {
         "rms_form": RMS_FORM,
+        "sum_of_squares": SUM_OF_SQUARES,
         "projection": PROJECTION,
         "reference_projection": REFERENCE_PROJECTION,
         "weights": "sigmoid(.) + hc_pre_eps",
-        "stream_sum": "fp32, one cast to bf16",
+        "stream_sum": STREAM_SUM,
         "downcast_points": ["out"],
-        "bit_params": list(HEAD_BIT_PARAMS),
+        "arithmetic_constants": dict(ARITHMETIC_CONSTANTS),
     },
 }
 
@@ -179,20 +188,18 @@ def describe(op: str) -> dict[str, object]:
 
 __all__ = [
     "AITER_COMMIT",
+    "ARITHMETIC_CONSTANTS",
     "BATCH_INVARIANCE",
     "HC_MULT",
     "HC_POST_MULT_VALUE",
     "HC_PRE_EPS",
     "HC_SINKHORN_EPS",
-    "HEAD_BIT_PARAMS",
     "MIX_DTYPE",
     "MHCContractError",
     "OPEN_ITEMS",
     "OPS",
     "OUTPUT_DTYPE",
     "PARAM_DTYPE",
-    "PRE_BIT_COMBINATIONS",
-    "PRE_BIT_PARAMS",
     "PROFILE",
     "RESIDUAL_DTYPE",
     "RMS_EPS",
