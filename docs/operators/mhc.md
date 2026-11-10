@@ -40,11 +40,15 @@ each backend follows is recorded in `rl_engine/contracts/operators/mhc.py`
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | CUDA | — | — | Not implemented; the registry raises |
-| ROCm | `AiterMHCPreOp`, `AiterMHCPostOp`, `AiterMHCHeadOp` in `rl_engine/backends/rocm/mhc/aiter_mhc.py` | aiter `mhc_pre_dsv4`, `mhc_post_dsv4`, `mhc_head_dsv4` (Triton) | Forward batch invariant; backward is aiter's PyTorch recompute |
+| ROCm | `TritonMHCPreOp`, `TritonMHCPostOp`, `TritonMHCHeadOp` in `rl_engine/backends/rocm/mhc/triton_mhc.py` | Triton kernels copied from aiter `326cffa` (`mhc_pre_dsv4`, `mhc_post_dsv4`, `mhc_head_dsv4`) | Forward batch invariant by construction; backward recomputes in PyTorch, as aiter's |
 | PyTorch fallback | `NativeMHCPreOp`, `NativeMHCPostOp`, `NativeMHCHeadOp` in `rl_engine/reference/mhc/` | — | fp32 reference following DeepSeek-V4-Flash-0731 `inference/model.py`; CPU only |
 
-The ROCm ops need an aiter build with the DeepSeek-V4 mHC ops (aiter PR #5492 or
-later; measured with aiter `326cffa` and `AITER_TRITON_ONLY=1`).
+The ROCm ops do not need aiter. aiter cannot support batch invariance officially,
+so its Triton kernels were copied into RL-Kernel and changed so that batch
+invariance holds by construction. The aiter ops with per-M config tables
+(`AiterMHCPreOp`, `AiterMHCPostOp`, `AiterMHCHeadOp` in
+`rl_engine/backends/rocm/mhc/aiter_mhc.py`) are no longer registered; they stay
+as the baseline of the benchmarks until they are removed.
 
 ## Tensor Contract
 
@@ -65,75 +69,68 @@ flattened into the token count M.
 
 ## Dispatch Behavior
 
-On ROCm the registry hands out only the aiter ops: a missing aiter raises instead
-of falling back to an op whose bits change with the batch. Inputs outside the
-tensor contract (other dtypes, n ≠ 4, mismatched shapes) raise as well. CPU gets
-the PyTorch references; CUDA, MUSA and NPU have no mHC backend, and `get_op`
-raises there. The semantic catalog declares the aiter ops for bf16 on
-ROCm with `batch_invariant: True` and `backward_batch_invariant: False`.
+On ROCm the registry hands out only the Triton ops, without fallback to an op
+whose bits change with the batch. Inputs outside the tensor contract (other
+dtypes, n ≠ 4, mismatched shapes) raise. CPU gets the PyTorch references; CUDA,
+MUSA and NPU have no mHC backend, and `get_op` raises there. The semantic catalog
+declares the Triton ops for bf16 on ROCm with `batch_invariant: True` and
+`backward_batch_invariant: False`.
 
-aiter chooses mhc_pre's launch config by M and, on gfx942, splits K into 8, 4 or
-2 segments from M = 1024 on, so a row's bits change with the batch. The ops pass
-the config through aiter's public `config` argument instead, chosen by
-`rl_engine/backends/rocm/config_utils.py`:
+The copy keeps aiter's arithmetic except for three changes, so its results
+differ from aiter's only by the order of the sums and by the fp32 projection
+(module docstring of `triton_mhc.py`; why aiter's bits change with launch
+parameters: [mHC Reduction Order and Batch Invariance on ROCm](mhc-reduction-order.md)):
 
-- The GPU arch is that of the input's device. On gfx942 with n = 4, C = 4096
-  the config comes per M from
-  `configs/gfx942/mhc_pre/MHC_PRE-n=4-C=4096.json` and
-  `configs/gfx942/mhc_head/MHC_HEAD-n=4-C=4096.json` (`M_LEQ_x` buckets, the
-  smallest x ≥ M, else `"any"`). Other GPUs and shapes use one config for every
-  M: `FIXED_PRE_CONFIG` (no K split) and aiter's own head config
-  (`FIXED_HEAD_CONFIG`).
-- Checked when a table is loaded, with `ValueError` otherwise: every key is
-  `M_LEQ_x` or `"any"`, the `"any"` entry exists, and every entry agrees on the
-  parameters that change the output bits. Measured on MI325X, Triton 3.7:
+- **Batch invariant by construction.** mHC pre and mHC head always run a split
+  kernel over 4 segments of K (`NUM_KSPLIT`, for K = 16384), then an apply kernel
+  that adds the segments in segment order. aiter switches between a fused
+  kernel and this split pair, and picks the number of segments by M. Every sum
+  has its order written in the source instead of leaving it to `tl.sum`, whose
+  tree follows the tile layout:
+  - sum of squares: accumulated element-wise with `tl.fma` over the K tiles of
+    128 (`BLOCK_K`) of a segment, then the 128 columns are added pairwise;
+  - projection: `tl.dot` over the same K tiles;
+  - weighted sum of the 4 streams (`layer_input`, mHC head output): one `tl.fma`
+    per stream in stream order;
+  - Sinkhorn row and column sums: pairwise, `(p0 + p1) + (p2 + p3)`;
+  - mHC post: aiter's kernel, which already adds the source streams in a loop.
 
-| Op | Free to change per M | Change the bits |
-| --- | --- | --- |
-| mhc_pre | `BLOCK_M` (16–128), `BLOCK_C` (≤ 128), `num_warps`, `num_stages`, `waves_per_eu` | `NUM_KSPLIT`, `BLOCK_K`, `kpack`, `BLOCK_C=256`, `BLOCK_M=16` with `num_warps=8` |
-| mhc_head | `num_stages`, `waves_per_eu` | `BLOCK_M`, `BLOCK_K`, `BLOCK_C`, `num_warps`, `kpack` |
+  `NUM_KSPLIT`, `BLOCK_K` and the MFMA shape (`matrix_instr_nonkdim=16`,
+  `kpack=1`) are module constants. The other launch parameters only group tokens
+  and hidden positions into workgroups and do not change the bits; each op uses
+  one config (`PRE_CONFIG`, `HEAD_CONFIG`, `POST_CONFIG`) for every M.
+- **Dynamic shape.** M is a runtime argument of every kernel and Triton does
+  not specialize it (`do_not_specialize`); the partial results are stored
+  `[M, segment, column]`, so no stride depends on M. A new token count compiles
+  nothing (aiter declares M `tl.constexpr` in its fused, split and head kernels).
+- **Projection precision of the DeepSeek-V4 model.** `fn` and `head_fn` stay fp32
+  and the projection is an fp32 `tl.dot` with `input_precision="ieee"` (aiter
+  rounds them to bf16). The PyTorch-recompute backward projects with fp32 `fn` too.
 
-Any fixed `NUM_KSPLIT` used for every M is batch invariant. The mhc_pre table
-splits K into 4 segments with `BLOCK_K=128` at every M. mhc_head's public
-`config` cannot set `num_warps` or `num_stages`, so its table only changes
-`waves_per_eu`. mhc_post's config does not depend on M and is aiter's.
-
-`BLOCK_K` changes the bits through the RMS sum of squares
-(`acc_sq += tl.sum(x * x, axis=1)`), not through the projection (`tl.dot`).
-Measured on MI325X, Triton 3.7, n = 4, C = 4096, M = 17 and 1024 (job
-68297426): with inputs whose sum of squares is exact in any order (entries in
-{±1, ±2}), `BLOCK_K` = 32, 64, 256 against 128 (mhc_pre, `NUM_KSPLIT` = 1 and
-4) and 32, 128, 256 against 64 (mhc_head) give the same bits; with an exact
-projection (one-hot `fn`) and random inputs they differ, e.g. mhc_pre
-`NUM_KSPLIT=4`, `BLOCK_K=32`: post_mix 525/4096, comb_mix 3754/16384 elements
-at M = 1024. `BLOCK_C=256` on mhc_pre changes only `layer_input`, that is the
-stream sum `tl.sum(pre_mix * x, axis=1)`. Why these parameters change the bits,
-the reference implementations and the candidates for a fixed reduction order:
-[mHC Reduction Order and Batch Invariance on ROCm](mhc-reduction-order.md).
-
-`rl_engine.backends.rocm.config_utils.selected_configs()` lists the configs that
-ran in the process, one record per GPU arch, op, table file and bucket: `arch`,
-`op`, `file`, `bucket` (`M_LEQ_x`, `"any"`, or `"default"` without a table),
-`source` (the table path or `"default"`), `config`, and `m_min` / `m_max`, the
-smallest and largest M that used it.
+mHC head uses the split and apply structure of mHC pre; aiter's head kernel runs
+one workgroup per 16 tokens over all of K and C.
 
 ## Accuracy
 
 - The PyTorch references compute in fp32 and cast `layer_input`, the post output
   and the head output to bf16, as DeepSeek-V4 does; `forward_fp32` keeps fp32.
-  The aiter ops match `forward_fp32`, including the residual gradient, within
+  The ROCm ops match `forward_fp32`, including the residual gradient, within
   the WS1 contract tolerance (`rl_engine/contracts/profiles/precision/ws1.json`,
   bfloat16 `reduction` cells of `forward_accuracy` and `gradient_accuracy`).
 - The RMS factor is `rsqrt(mean(x²) + eps)`, as in DeepSeek-V4 and aiter.
-- aiter rounds `fn` and `head_fn` to bf16 before the projection; the checkpoint
-  stores them in fp32 and almost none of their values are exact in bf16. The
-  reference projects in fp32. Which precision the project uses is open.
-- aiter sums the four streams of `layer_input` as
-  `fma(w2, x2, w0·x0) + fma(w3, x3, w1·x1)` in fp32 and rounds to bf16 once.
+- The projection uses the fp32 `fn` and `head_fn`, as DeepSeek-V4 does (decided
+  2026-11-10); aiter rounds them to bf16, which dominated its error against the
+  reference (largest `post_mix` error 3.6e-3).
+- The four streams of `layer_input` and of the mHC head output are added as
+  `fma(w3, x3, fma(w2, x2, fma(w1, x1, w0·x0)))` in fp32 and rounded to bf16 once.
 - `mhc_layer_end`'s lm_head uses `batch_invariant_linear` with bf16 inputs and
   fp32 output (see [Batch-Invariant Linear](batch-invariant-linear.md)).
 
 ## Performance Notes
+
+Not measured yet for the Triton ops; the measurement is
+`benchmarks/operators/mhc/evaluate_triton_mhc.py`, with the aiter ops and their
+config tables as the baseline. The tables below are the aiter ops before the copy.
 
 Forward device time of mHC pre, n = 4, C = 4096, bf16 residual, fp32 `fn`, 20
 Sinkhorn rounds; ms per call from GPU events, median over 5 trials of 50 calls.
@@ -200,10 +197,10 @@ python benchmarks/operators/mhc/benchmark_mhc_head.py --output mhc_head.md
 ```bash
 python -m pytest tests/reference/test_mhc_reference.py tests/ops/mhc \
     tests/contracts/operators/test_mhc_contract.py \
-    tests/backends/rocm/test_rocm_launch_config.py \
     tests/backends/rocm/test_rocm_mhc_pre.py tests/backends/rocm/test_rocm_mhc_post.py \
     tests/backends/rocm/test_rocm_mhc_head.py \
-    tests/backends/rocm/test_rocm_mhc_batch_invariance.py tests/models/deepseek_v4 -v
+    tests/backends/rocm/test_rocm_mhc_batch_invariance.py \
+    tests/backends/rocm/test_rocm_dynamic_shape.py tests/models/deepseek_v4 -v
 ```
 
 `tests/backends/rocm/test_rocm_mhc_batch_invariance.py` checks mHC pre, mHC post
@@ -211,38 +208,31 @@ and mHC head, and `tests/models/deepseek_v4/test_layer_end_batch_invariance.py`
 the layer end, with `rl_engine/validation/common/batch_invariance.py`: a row alone
 and in batches of M = 1 to 16384 (including the WS1 manifest's 8 and 59),
 chunking, reordering and padding, other input strides, repeated runs, and forward
-with and without grad. The mHC op tests also record which launch configs ran and
-run at C = 7168, which has no table, so the default configs are covered.
+with and without grad, at C = 4096 and at C = 7168, which is not a power of two.
 `test_rocm_mhc_pre.py` isolates the projection, RMS, Sinkhorn and stream
 aggregation with exact inputs, and checks the projection and RMS under chunking,
-reordering, padding and other strides as well. Accuracy against the fp32
+reordering, padding and other strides as well. The pre, post and head tests
+check that other launch configs give the same bits, and
+`test_rocm_dynamic_shape.py` that unseen M values compile nothing. Accuracy against the fp32
 references uses the WS1 contract tolerance. Unsupported inputs and the layer end
 against a PyTorch reference are tested as well, and empty batches for mHC pre,
 mHC post, mHC head and the batch-invariant linear.
 
 ## Known Limitations
 
-- Backward is not batch invariant: aiter recomputes it in PyTorch. Those tests are
-  marked xfail.
-- The tables are measured for gfx942 with Triton 3.7 and DeepSeek-V4-Flash's
-  n = 4, C = 4096 only; other shapes and GPUs use the default configs.
-- aiter's own mhc_pre config cannot launch for M = 8192–16383 on gfx942 with
-  C = 4096; the tables avoid it.
+- Backward is not batch invariant: it recomputes the formula in PyTorch, as
+  aiter's does. Those tests are marked xfail.
+- The number of K segments (4) and the launch configs are chosen for
+  DeepSeek-V4-Flash's n = 4, C = 4096 on gfx942; other hidden sizes run with the
+  same constants (K positions past the end of K are zeros).
 - No CUDA kernel. The registry has no mhc_pre, mhc_post or mhc_head backend on
   CUDA, MUSA or NPU, so `get_op` raises there.
 - `mhc_layer_end` does not support an empty batch: with zero tokens the PyTorch
   RMSNorm reference it uses for the final norm raises
   (`rl_engine/reference/norm/rms_norm.py` reshapes the empty tensor with
   `reshape(*shape[:-1], -1, 32)`, whose `-1` cannot be inferred).
-- aiter `326cffa` declares M as `tl.constexpr` in `_mhc_fused_kernel` and
-  `_mhc_fused_split_kernel` (mHC pre) and `_mhc_head_kernel` (mHC head), so every
-  new token count M compiles these kernels again; the tuning runs saw about 10 s
-  per config and M on MI325X. `_mhc_reduce_apply_kernel`,
-  `_mhc_asymmetric_sinkhorn_kernel` and `_mhc_post_kernel` take M as a runtime
-  argument.
 - CUDA/HIP graph capture is not covered here; it belongs to the framework
   integration (DSV4 RFC task 7, #510).
 - Open for the RFC author: the RFC asks for a controller RMS of
   `1 / (sqrt(mean) + eps)`, while aiter and the DeepSeek-V4 reference use
-  `rsqrt(mean + eps)`; and aiter rounds `fn` to bf16 before the projection. The
-  tests record aiter's behavior for both.
+  `rsqrt(mean + eps)`. The tests record the latter.

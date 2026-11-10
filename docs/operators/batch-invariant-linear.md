@@ -3,7 +3,9 @@
 ## Summary
 
 `y = x @ weightᵀ + bias` whose output row does not depend on the other rows in the
-batch, on ROCm through aiter's `gemm_a16w16`. DSV4 RFC task 9
+batch, on ROCm with aiter's `gemm_a16w16` Triton kernel copied into RL-Kernel and
+made batch invariant by construction (aiter cannot guarantee batch invariance).
+DSV4 RFC task 9
 ([#510](https://github.com/RL-Align/RL-Kernel/issues/510)): a shared GEMM
 with a fixed K accumulation order, bias and output conversion, with fp32 output
 for DeepSeek-V4's lm_head.
@@ -22,8 +24,12 @@ logits = linear(x, weight, out_dtype=torch.float32)  # x [..., K], weight [N, K]
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | CUDA | — | — | Not implemented |
-| ROCm | `AiterBatchInvariantLinearOp` in `rl_engine/backends/rocm/gemm/aiter_gemm.py` | aiter `gemm_a16w16` (Triton) | Forward batch invariant; backward through det_gemm's fixed-order Triton GEMM in fp32 |
-| PyTorch fallback | — | — | None: a missing aiter raises |
+| ROCm | `TritonBatchInvariantLinearOp` in `rl_engine/backends/rocm/gemm/triton_gemm.py` | `_gemm_a16_w16_kernel` (Triton), copied from aiter `326cffa` | Forward batch invariant; backward through det_gemm's fixed-order Triton GEMM in fp32 |
+| PyTorch fallback | — | — | None |
+
+`AiterBatchInvariantLinearOp` (`rl_engine/backends/rocm/gemm/aiter_gemm.py`, aiter
+`gemm_a16w16` with a per-M config table) is no longer registered; it stays as the
+baseline of the benchmarks until it is removed.
 
 ## Tensor Contract
 
@@ -36,32 +42,27 @@ logits = linear(x, weight, out_dtype=torch.float32)  # x [..., K], weight [N, K]
 
 ## Dispatch Behavior
 
-The registry hands out `AiterBatchInvariantLinearOp` for `batch_invariant_linear`
+The registry hands out `TritonBatchInvariantLinearOp` for `batch_invariant_linear`
 on ROCm only, without fallback. CUDA, MUSA, CPU and NPU have no backend, and
 `get_op` raises there. Inputs outside the tensor contract raise; an
 empty batch returns an empty output without a launch. The semantic catalog
 declares it for bf16 on ROCm with `batch_invariant: True`.
 
-aiter chooses gemm_a16w16's config by (M, N, K), and some of its configs split K,
-which makes results change with M. The op passes the config through aiter's
-public `config` argument, chosen by `rl_engine/backends/rocm/config_utils.py`:
+What the copy changes in aiter's kernel (module docstring of `triton_gemm.py`):
 
-- A shape with a table for the arch of the input's GPU uses the config of M's
-  bucket (`M_LEQ_x`, the smallest x ≥ M, else `"any"`). Today that is the
-  DeepSeek-V4-Flash lm_head on gfx942,
-  `configs/gfx942/gemm_a16w16/GEMM-A16W16-N=129280-K=4096.json`.
-- Every other shape and GPU uses `FIXED_LINEAR_CONFIG` for every M.
-- Checked when a table is loaded, with `ValueError` otherwise: every key is
-  `M_LEQ_x` or `"any"`, the `"any"` entry exists, and every entry keeps the
-  parameters that change the output bits. Measured on MI325X with Triton 3.7:
-  `NUM_KSPLIT` and `kpack` change them; `BLOCK_SIZE_M/N/K`, `GROUP_SIZE_M`,
-  `num_warps`, `num_stages`, `waves_per_eu` and `cache_modifier` do not. Tables
-  keep `NUM_KSPLIT=1`, `kpack=1` and `matrix_instr_nonkdim=16`; only whole-K
-  configs are accepted.
-- `rl_engine.backends.rocm.config_utils.selected_configs()` lists the configs
-  that ran, one record per GPU arch, op, table file and bucket, with the smallest
-  and largest M that used it (`m_min`, `m_max`); see
-  [mHC](mhc.md#dispatch-behavior) for the fields.
+- **Batch invariant by construction.** K is never split: aiter's split-K path,
+  which some of aiter's configs choose by M, is removed. The K tile is the module
+  constant `BLOCK_K = 64` and the MFMA shape is fixed (`matrix_instr_nonkdim=16`,
+  `kpack=1`), so an output element is accumulated in the same order for every M
+  and every launch config. Inside a tile there is only `tl.dot`, no `tl.sum`.
+- **Dynamic shape.** M and N are runtime arguments that Triton does not
+  specialize; aiter's compile-time `EVEN_MN` switch is removed (always the masked
+  path), and `EVEN_K` depends on K only. A new M compiles nothing.
+- **Launch config.** Chosen from `CONFIGS` by M (four buckets: M ≤ 16, ≤ 128,
+  ≤ 1024, larger). The configs only group output tiles into workgroups; they do
+  not change the bits. Each compiles once per process;
+  `TritonBatchInvariantLinearOp.warmup(weight)` compiles all of them.
+- Activations, `skip_reduce` and aiter's persistent and gluon paths are removed.
 
 ## Accuracy
 
@@ -74,6 +75,10 @@ fp32 PyTorch linear within the WS1 contract tolerance
 `forward_accuracy` and `gradient_accuracy`).
 
 ## Performance Notes
+
+Not measured yet for `TritonBatchInvariantLinearOp`; the measurement is
+`benchmarks/operators/gemm/evaluate_triton_linear.py`, with the aiter op below as
+the baseline. The table below is the aiter op before the copy.
 
 Device time of the DeepSeek-V4-Flash lm_head GEMM: x [M, 4096] bf16 × weight
 [129280, 4096] bf16, fp32 logits; ms per call from GPU events, median over 5
@@ -108,7 +113,7 @@ python benchmarks/operators/gemm/benchmark_lm_head_linear.py --config-table \
 
 ```bash
 python -m pytest tests/backends/rocm/test_rocm_batch_invariant_linear.py \
-    tests/backends/rocm/test_rocm_launch_config.py -v
+    tests/backends/rocm/test_rocm_dynamic_shape.py -v
 ```
 
 Covers the DeepSeek-V4 mHC projection shapes (N = 24 and 4, K = 16384), the WS1
@@ -117,13 +122,13 @@ not tile multiples, the lm_head shape, bf16 and fp32 output, and bias: a row alo
 and in batches of M = 1 to 16384 (8192 for lm_head, including the WS1 manifest's
 8 and 59), chunking, reordering and padding, other input strides, repeated runs,
 the fp32 reference, the input gradient, empty batches and unsupported inputs.
-Every shape but lm_head runs `FIXED_LINEAR_CONFIG`.
+M includes the largest M of every `CONFIGS` bucket and the M after it, and every
+entry of `CONFIGS` is also compared with the first one directly.
+`test_rocm_dynamic_shape.py` checks that unseen M values compile nothing after
+`warmup`.
 
 ## Known Limitations
 
-- Only the lm_head shape has a tuned table, measured on gfx942 with Triton 3.7;
-  other shapes use one fixed config.
-- `matrix_instr_nonkdim=32` gave the same bits as 16 in the measurement, but it was
-  not checked that Triton emitted a different instruction, so tables keep 16 and
-  the table check treats it as a parameter that changes the bits.
+- The `CONFIGS` buckets are a first choice for the lm_head shape on gfx942; they
+  are to be set from the device-time measurement.
 - No CUDA kernel.
