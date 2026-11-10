@@ -500,6 +500,38 @@ is used only on gfx950 with `SGLANG_USE_AITER`.
 | SGLang `hc_mix_stats` | yes | `tl.sum` per 64-value tile with fixed constants; `BLOCK_M` fixed on HIP | no | not used; gfx942 runs plain PyTorch |
 | aiter Triton with RL-Kernel's tables (`aiter_config_table`) | yes | `tl.sum` per tile; configs chosen so that layouts are equal | no (measured) | depends on the Triton version |
 
+### 6.10 The principles behind these implementations
+
+The implementations above use four principles, usually several at once.
+
+| Principle | What it means | Used by |
+|---|---|---|
+| The K split depends only on K | The number of K segments is computed from K, N, the dtype or the GPU, never from M, and the segments are added in a fixed order. | DeepGEMM (the caller passes the number of segments); vLLM on NVIDIA (computed as for M = 1); vLLM's batch-invariant matmul (`_split_k_plan(K, N)`); SGLang `hc_mix_stats` (`_num_slices_for(K)`); `aiter_config_table` (`NUM_KSPLIT = 4` for every M); `fixed_order` (`num_k_splits(K)`); `aiter_hip` with a fixed split |
+| The order inside a tile is fixed by fixed compile-time constants | The kernel still calls `tl.sum`; the parameters that decide its layout (`BLOCK_*`, `num_warps`) are held constant, so the compiler produces the same order every time. | `aiter_config_table`; vLLM's batch-invariant RMSNorm (`BLOCK_SIZE = 1024`, default `num_warps`); SGLang `hc_mix_stats` (`BLOCK_K = 64`, `num_warps = 4`, `BLOCK_M = 16` on HIP) |
+| The order inside a tile is written in the kernel source | Each thread adds its values serially and a fixed exchange or pairwise addition combines threads; the tile sizes are constants. | DeepGEMM (serial sums and `warp_reduce_sum<4>`); `fixed_order` (pairwise rounds); aiter's HIP `mhc_pre_gemm_sqrsum` (`cross_row_sum_4`); vLLM's TileLang kernel (serial sum, warp reduction, serial sum over warps). In the last two the thread count or the split still follows M, so they are not batch invariant as a whole. |
+| One code path for every M | Fused kernels, library calls and dispatch decisions that switch with M are turned off. | vLLM #59929 (no fused post-and-pre kernel in batch-invariant mode); vLLM on ROCm in batch-invariant mode (Triton matmul instead of hipBLASLt, no skinny GEMM); vLLM's CUDA layernorm (block size locked); SGLang in batch-invariant mode (no DeepGEMM, no bf16x3 projection) |
+| One launch per token | Every token runs as M = 1, so the batch cannot matter; the cost is M launches. | vLLM before #59929 (ISEEKYAN `4b5c627`): the fused post-and-pre kernel looped over tokens in Python in batch-invariant mode; #59929 replaced this with one code path for every M. |
+
+The second and third principles differ in what they depend on. Fixing the
+constants relies on the compiler turning the same constants into the same
+order. Between Triton 3.7.0 and 3.8.0 the layouts stayed the same but the order
+inside a thread changed, and the bits of `aiter_config_table` changed with it
+(section 7.4). vLLM's RMSNorm and SGLang's `hc_mix_stats` rely on the same
+mechanism; that was read in their code, not measured. Writing the order in the
+source does not depend on the layout or on the Triton version: `fixed_order`
+kept its bits between 3.7.0 and 3.8.0.
+
+How the projection and the sum of squares of mHC are handled:
+
+| Implementation | K split depends only on K | Order inside a tile | One code path for every M | gfx942 |
+|---|---|---|---|---|
+| `aiter_config_table` (RL-Kernel PR) | yes | fixed constants | yes | batch invariant; bits change between Triton versions |
+| `fixed_order` (RL-Kernel) | yes | written in the source | yes | batch invariant; same bits with Triton 3.7.0 and 3.8.0 |
+| `aiter_hip` with a fixed split | yes | written in the source | partly: the output tile and the big-fuse launch still follow M; no effect measured with up to 8 segments | batch invariant |
+| DeepGEMM, vLLM on NVIDIA | yes | written in the source | yes | NVIDIA only |
+| SGLang `hc_mix_stats` | yes | fixed constants | yes | used on gfx950 only; gfx942 runs plain PyTorch |
+| vLLM on ROCm (aiter HIP as is) | no, the split follows M | written in the source | no | not batch invariant from M = 1024 on (measured) |
+
 ## 7. Approaches we compared
 
 All measurements: MI325X (gfx942), torch 2.12.0 with ROCm 7.14, Triton 3.7.0,
