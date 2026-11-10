@@ -18,6 +18,7 @@ from __future__ import annotations
 import torch
 
 from rl_engine.backends.rocm.config_utils import get_config
+from rl_engine.backends.rocm.gemm.triton_gemm import check_linear_inputs
 from rl_engine.utils.logger import logger
 
 # Default: aiter 326cffa's gfx942 default for small M (gemm_a16w16/DEFAULT.json,
@@ -40,27 +41,6 @@ FIXED_LINEAR_CONFIG = {
 # Parameters of gemm_a16w16 that change the output bits
 # (docs/operators/batch-invariant-linear.md).
 LINEAR_BIT_PARAMS = ("NUM_KSPLIT", "kpack", "matrix_instr_nonkdim")
-
-
-SUPPORTED_OUT_DTYPES = (torch.bfloat16, torch.float32)
-
-
-def check_linear_inputs(x, weight, bias, out_dtype):
-    """Raise for an input this op does not support, instead of running it unvalidated:
-    x [..., K] and weight [N, K] in bf16, bias [N] in out_dtype, out_dtype bf16 or fp32."""
-    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
-        raise TypeError(f"x and weight must be bf16, got {x.dtype} and {weight.dtype}")
-    if out_dtype not in SUPPORTED_OUT_DTYPES:
-        raise TypeError(f"out_dtype must be one of {SUPPORTED_OUT_DTYPES}, got {out_dtype}")
-    if x.dim() < 1 or weight.dim() != 2 or weight.shape[1] != x.shape[-1]:
-        raise ValueError(
-            f"x [..., K] and weight [N, K] do not match: {tuple(x.shape)}, {tuple(weight.shape)}"
-        )
-    if bias is not None and (bias.dtype != out_dtype or tuple(bias.shape) != (weight.shape[0],)):
-        raise ValueError(
-            f"bias must be [{weight.shape[0]}] in {out_dtype}, "
-            f"got {tuple(bias.shape)} in {bias.dtype}"
-        )
 
 
 def select_config(m: int, n: int, k: int, device: torch.device) -> dict:
