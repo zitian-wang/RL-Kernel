@@ -22,6 +22,12 @@ from __future__ import annotations
 import torch
 
 from rl_engine.backends.rocm.config_utils import get_config
+from rl_engine.backends.rocm.mhc.triton_mhc import (  # noqa: F401  (SUPPORTED_N re-exported)
+    SUPPORTED_N,
+    check_head_inputs,
+    check_post_inputs,
+    check_pre_inputs,
+)
 from rl_engine.utils.logger import logger
 
 # Default for mhc_pre_dsv4: the config aiter 326cffa picks itself for M=1 on
@@ -62,37 +68,6 @@ def _import_aiter_mhc():
             "aiter with the DeepSeek-V4 mHC ops (aiter PR #5492 or later) is required."
         ) from exc
     return mhc_pre_dsv4, mhc_post_dsv4, mhc_head_dsv4
-
-
-# DeepSeek-V4's hc_mult; aiter's kernels are only validated with it.
-SUPPORTED_N = 4
-
-
-def _check(name, tensor, dtype, shape=None):
-    """Raise for an input these ops do not support, instead of running it unvalidated."""
-    if tensor.dtype != dtype:
-        raise TypeError(f"{name} must be {dtype}, got {tensor.dtype}")
-    if shape is not None and tuple(tensor.shape) != tuple(shape):
-        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(tensor.shape)}")
-
-
-def _check_streams(residual):
-    """(n, C) of a bf16 residual [..., n, C] with n = SUPPORTED_N."""
-    _check("residual", residual, torch.bfloat16)
-    if residual.dim() < 2 or residual.shape[-2] != SUPPORTED_N:
-        raise ValueError(
-            f"residual must have shape [..., {SUPPORTED_N}, C], got {tuple(residual.shape)}"
-        )
-    return residual.shape[-2:]
-
-
-def check_pre_inputs(residual, fn, scale, base):
-    """Inputs of AiterMHCPreOp: bf16 residual [..., n, C]; fp32 fn, scale, base."""
-    n, c = _check_streams(residual)
-    rows = 2 * n + n * n
-    _check("fn", fn, torch.float32, (rows, n * c))
-    _check("scale", scale, torch.float32, (3,))
-    _check("base", base, torch.float32, (rows,))
 
 
 class AiterMHCPreOp:
@@ -140,26 +115,6 @@ class AiterMHCPreOp:
             config=config,
         )
         return post.reshape(*lead, n), comb.reshape(*lead, n, n), layer_input.reshape(*lead, c)
-
-
-def check_post_inputs(y, residual, post_mix, comb_mix):
-    """Inputs of AiterMHCPostOp: bf16 y [..., C] and residual [..., n, C]; fp32 post_mix
-    [..., n] or [..., n, 1] and comb_mix [..., n, n]."""
-    n, c = _check_streams(residual)
-    lead = tuple(residual.shape[:-2])
-    _check("y", y, torch.bfloat16, (*lead, c))
-    _check("post_mix", post_mix, torch.float32)
-    if tuple(post_mix.shape) not in ((*lead, n), (*lead, n, 1)):
-        raise ValueError(f"post_mix must have shape {(*lead, n)}, got {tuple(post_mix.shape)}")
-    _check("comb_mix", comb_mix, torch.float32, (*lead, n, n))
-
-
-def check_head_inputs(residual, fn, scale, base):
-    """Inputs of AiterMHCHeadOp: bf16 residual [..., n, C]; fp32 fn, scale, base."""
-    n, c = _check_streams(residual)
-    _check("fn", fn, torch.float32, (n, n * c))
-    _check("scale", scale, torch.float32, (1,))
-    _check("base", base, torch.float32, (n,))
 
 
 class AiterMHCPostOp:
