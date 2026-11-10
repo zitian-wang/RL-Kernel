@@ -2,7 +2,7 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """CPU tests for the mHC entry: dispatch through kernel_registry to the reference.
 
-The aiter path on ROCm is tested in tests/backends/rocm/test_rocm_mhc_*.py.
+The ROCm ops are tested in tests/backends/rocm/test_rocm_mhc_*.py.
 """
 
 import pytest

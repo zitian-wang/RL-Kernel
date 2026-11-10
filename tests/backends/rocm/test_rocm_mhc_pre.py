@@ -2,11 +2,12 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """Checks for the ROCm mHC pre op, split into DSV4 RFC tasks 1, 2 and 3 (#508).
 
-aiter computes all three tasks inside one op, ``mhc_pre_dsv4``, which only
-returns post_mix, comb_mix and layer_input. The tests call that public op only
-and separate the tasks by constructing inputs that make every step upstream of
-the task under test exact and independent of accumulation order. A bits
-difference across M can then only come from the task under test:
+The op (``TritonMHCPreOp``, rl_engine/backends/rocm/mhc/triton_mhc.py) computes
+all three tasks in one call, which only returns post_mix, comb_mix and
+layer_input. The tests call the op only and separate the tasks by constructing
+inputs that make every step upstream of the task under test exact and
+independent of accumulation order. A bits difference across M can then only
+come from the task under test:
 
 - task 1 (projection and RMS): sinkhorn_repeat=0, scale=1, base=0 make comb_mix
   equal (x @ fn_res^T) / r for the 16 res columns. One-hot fn rows make the
@@ -19,13 +20,11 @@ difference across M can then only come from the task under test:
   pre weights exactly fl(1 + 1e-6) or fl(1e-6), so layer_input only depends on
   the four-stream sum and its bf16 cast.
 
-Each batch-invariance check runs with the integrated op (per-M config table)
-and, as a diagnostic, with aiter's own config choice. M covers the WS1
-manifest's token counts (8, 59), aiter's K-split switch points (1024 on) and
-the upper bound of every bucket of the gfx942 mHC pre table, so every tuned
-config runs. The task 1 cases are also checked under chunking, reordering and
-padding, and in other storage strides, with the integrated op. The whole op is
-checked in tests/backends/rocm/test_rocm_mhc_batch_invariance.py.
+M covers the WS1 manifest's token counts (8, 59), the RFC switch points (16,
+17) and powers of two up to 16384. The task 1 cases are also checked under
+chunking, reordering and padding, and in other storage strides. The whole op is
+checked in tests/backends/rocm/test_rocm_mhc_batch_invariance.py. Launch
+configs other than the default must give the same bits.
 
 Accuracy against the fp32 reference uses the WS1 contract tolerance, for the
 whole op and for the residual gradient under extreme Sinkhorn logits.
@@ -35,7 +34,8 @@ import pytest
 import torch
 
 from rl_engine.backends.rocm import config_utils
-from rl_engine.backends.rocm.mhc.aiter_mhc import FIXED_PRE_CONFIG, PRE_BIT_PARAMS, check_pre_inputs
+from rl_engine.backends.rocm.mhc.aiter_mhc import FIXED_PRE_CONFIG, PRE_BIT_PARAMS
+from rl_engine.backends.rocm.mhc.triton_mhc import check_pre_inputs, mhc_pre_dsv4
 from rl_engine.reference.mhc import NativeMHCPreOp, sinkhorn_dsv4
 from rl_engine.runtime.registry import kernel_registry
 from rl_engine.runtime.semantic_registry import OperatorRequirements
@@ -47,56 +47,25 @@ from rl_engine.validation.common.batch_invariance import (
     differing_in_batch,
 )
 from tests.helpers.contract_tolerance import assert_matches_fp32_reference
-from tests.helpers.rocm_launch_configs import bucket_bounds
 
 _N, _C = 4, 4096  # DeepSeek-V4-Flash-0731: hc_mult, hidden_size
 _K = _N * _C
 _MIX = 2 * _N + _N * _N  # fn rows: [pre n | post n | res n*n]
 _PRE, _POST, _RES = slice(0, _N), slice(_N, 2 * _N), slice(2 * _N, _MIX)
-_M_VALUES = sorted(
-    {1, 8, 16, 17, 59, 1024, 2048, 4096, 8192, 16384}
-    | set(bucket_bounds("mhc_pre", f"MHC_PRE-n={_N}-C={_C}.json"))
-)
+_M_VALUES = [1, 8, 16, 17, 59, 64, 128, 256, 1024, 2048, 4096, 8192, 16384]
 _EPS = 1e-6
 
 
-def _ops():
+def _op():
     if not (torch.cuda.is_available() and torch.version.hip is not None):
         return None
-    try:
-        from aiter.ops.triton.fusions import mhc_pre_dsv4
+    from rl_engine.backends.rocm.mhc.triton_mhc import TritonMHCPreOp
 
-        from rl_engine.backends.rocm.mhc.aiter_mhc import AiterMHCPreOp
-
-        op = AiterMHCPreOp()
-    except (ImportError, RuntimeError):
-        return None
-
-    def aiter_default(residual, fn, scale, base, **kwargs):
-        post, comb, layer_input = mhc_pre_dsv4(residual, fn, scale, base, **kwargs)
-        return post.squeeze(-1), comb, layer_input
-
-    return {"rlkernel_config": op, "aiter_default_config": aiter_default}
+    return TritonMHCPreOp()
 
 
-_OPS = _ops()
-requires_aiter = pytest.mark.skipif(
-    _OPS is None, reason="ROCm GPU with aiter DeepSeek-V4 mHC ops required."
-)
-
-
-def _config_and_m(*, default_split_k_may_differ):
-    """(config, M) pairs. aiter's own config cannot launch for M in [8192, 16384)."""
-    params = []
-    for config in ("rlkernel_config", "aiter_default_config"):
-        for m in _M_VALUES:
-            marks = [requires_aiter]
-            if config == "aiter_default_config" and 8192 <= m < 16384:
-                marks.append(pytest.mark.xfail(strict=True, reason="needs 128 KB LDS, has 64 KB"))
-            elif config == "aiter_default_config" and m >= 1024 and default_split_k_may_differ:
-                marks.append(pytest.mark.xfail(reason="aiter's own config splits K for M >= 1024"))
-            params.append(pytest.param(config, m, marks=marks, id=f"{config}-M{m}"))
-    return params
+_OP = _op()
+requires_rocm = pytest.mark.skipif(_OP is None, reason="ROCm GPU required.")
 
 
 # ---------------------------------------------------------------------------
@@ -179,11 +148,11 @@ _TASK1_INPUTS = {
 }
 
 
-def _task1_case(config, inputs):
+def _task1_case(inputs, op=None):
     make_residual, make_fn = _TASK1_INPUTS[inputs]
     return _case(
         "projection_over_r",
-        _OPS[config],
+        op or _OP,
         make_residual,
         make_fn(),
         _ones_scale(),
@@ -193,52 +162,53 @@ def _task1_case(config, inputs):
     )
 
 
-@pytest.mark.parametrize("config,m", _config_and_m(default_split_k_may_differ=True))
-def test_task1_projection_and_rms_batch_invariance(config, m):
-    _assert_batch_invariant(_task1_case(config, "projection_and_rms"), m)
+@requires_rocm
+@pytest.mark.parametrize("m", _M_VALUES)
+def test_task1_projection_and_rms_batch_invariance(m):
+    _assert_batch_invariant(_task1_case("projection_and_rms"), m)
 
 
-@pytest.mark.parametrize("config,m", _config_and_m(default_split_k_may_differ=True))
-def test_task1_rms_alone_batch_invariance(config, m):
-    _assert_batch_invariant(_task1_case(config, "rms_alone"), m)
+@requires_rocm
+@pytest.mark.parametrize("m", _M_VALUES)
+def test_task1_rms_alone_batch_invariance(m):
+    _assert_batch_invariant(_task1_case("rms_alone"), m)
 
 
-@pytest.mark.parametrize("config,m", _config_and_m(default_split_k_may_differ=True))
-def test_task1_projection_alone_batch_invariance(config, m):
-    _assert_batch_invariant(_task1_case(config, "projection_alone"), m)
+@requires_rocm
+@pytest.mark.parametrize("m", _M_VALUES)
+def test_task1_projection_alone_batch_invariance(m):
+    _assert_batch_invariant(_task1_case("projection_alone"), m)
 
 
 # The same three cases under chunking, reordering and padding, and in other
-# storage strides, with the integrated op.
-@requires_aiter
+# storage strides.
+@requires_rocm
 @pytest.mark.parametrize("inputs", list(_TASK1_INPUTS))
 def test_task1_chunk_reorder_pad_invariance(inputs):
-    differing = differing_after_chunk_reorder_pad(_task1_case("rlkernel_config", inputs), 4096)
+    differing = differing_after_chunk_reorder_pad(_task1_case(inputs), 4096)
     assert not differing, f"{inputs}: {differing}"
 
 
-@requires_aiter
+@requires_rocm
 @pytest.mark.parametrize("inputs", list(_TASK1_INPUTS))
 def test_task1_restride_invariance(inputs):
-    differing = differing_after_restride(_task1_case("rlkernel_config", inputs), 1024)
+    differing = differing_after_restride(_task1_case(inputs), 1024)
     assert not differing, f"{inputs}: {differing}"
 
 
 # RMS formula. With mean(x^2) = 2^-20, close to eps = 1e-6, the two candidate
 # formulas differ by about 30%: DeepSeek-V4 and aiter use rsqrt(mean + eps); the
-# issue's rule is 1 / (sqrt(mean) + eps). This records which one aiter computes;
-# the choice is an open decision for the RFC author. On MI325X aiter differed
-# from the rsqrt formula by 1.5e-5 relative at this small mean; the cause was
-# not investigated, so the tolerance is 1e-4.
-@requires_aiter
+# issue's rule is 1 / (sqrt(mean) + eps). This records which one the op computes
+# (aiter's); the choice is an open decision for the RFC author. On MI325X aiter
+# differed from the rsqrt formula by 1.5e-5 relative at this small mean; the
+# cause was not investigated, so the tolerance is 1e-4.
+@requires_rocm
 def test_task1_rms_formula_is_rsqrt_of_mean_plus_eps():
     m = 64
     sign = torch.sign(_normal_residual(m, 1).float())
     residual = (sign * 2.0**-10).to(torch.bfloat16)  # every |x| = 2^-10, mean(x^2) = 2^-20
     fn = _one_hot_fn(_RES)
-    _, comb, _ = _OPS["rlkernel_config"](
-        residual, fn, _ones_scale(), _zero_base(), sinkhorn_repeat=0
-    )
+    _, comb, _ = _OP(residual, fn, _ones_scale(), _zero_base(), sinkhorn_repeat=0)
     projection = (residual.float().flatten(-2) @ fn[_RES].t()).view(m, _N, _N)
     mean = torch.tensor(2.0**-20)
     dsv4 = projection * torch.rsqrt(mean + _EPS)
@@ -248,23 +218,20 @@ def test_task1_rms_formula_is_rsqrt_of_mean_plus_eps():
 
 
 # Projection precision. One nonzero input element per token makes the projection
-# equal to one fn entry: aiter rounds fn to bf16 before multiplying, while the
-# DeepSeek-V4 reference multiplies in fp32. This records aiter's behavior; the
-# project's choice is an open decision for the RFC author.
-@requires_aiter
-def test_task1_projection_rounds_fn_to_bf16():
+# equal to one fn entry: the op multiplies with the fp32 fn, as the DeepSeek-V4
+# model does (aiter rounds fn to bf16 first).
+@requires_rocm
+def test_task1_projection_uses_fp32_fn():
     m = 64
     residual = torch.zeros(m, _N, _C, device="cuda", dtype=torch.bfloat16)
     residual[:, 0, 0] = 1.0
     fn = _random_fn(seed=3)
-    _, comb, _ = _OPS["rlkernel_config"](
-        residual, fn, _ones_scale(), _zero_base(), sinkhorn_repeat=0
-    )
+    _, comb, _ = _OP(residual, fn, _ones_scale(), _zero_base(), sinkhorn_repeat=0)
     r_inv = torch.rsqrt(torch.tensor(1.0 / _K) + _EPS)
     fp32_weights = (fn[_RES, 0] * r_inv).view(_N, _N).expand(m, _N, _N)
     bf16_weights = (fn[_RES, 0].bfloat16().float() * r_inv).view(_N, _N).expand(m, _N, _N)
-    assert (comb - bf16_weights).abs().max() <= 1e-6 * bf16_weights.abs().max()
-    assert (comb - fp32_weights).abs().max() > 1e-4 * fp32_weights.abs().max()
+    assert (comb - fp32_weights).abs().max() <= 1e-6 * fp32_weights.abs().max()
+    assert (comb - bf16_weights).abs().max() > 1e-4 * bf16_weights.abs().max()
 
 
 # ---------------------------------------------------------------------------
@@ -281,21 +248,22 @@ def _task2_params():
     return _one_hot_fn(slice(_N, _MIX)), scale, base
 
 
-@pytest.mark.parametrize("config,m", _config_and_m(default_split_k_may_differ=False))
-def test_task2_post_and_sinkhorn_batch_invariance(config, m):
+@requires_rocm
+@pytest.mark.parametrize("m", _M_VALUES)
+def test_task2_post_and_sinkhorn_batch_invariance(m):
     fn, scale, base = _task2_params()
     for output_index, name in ((0, "post_mix"), (1, "comb_mix")):
-        case = _case(name, _OPS[config], _exact_residual, fn, scale, base, output_index)
+        case = _case(name, _OP, _exact_residual, fn, scale, base, output_index)
         _assert_batch_invariant(case, m)
 
 
 # Each Sinkhorn round against DeepSeek-V4's algorithm, starting from the op's own
 # logits (sinkhorn_repeat=0) so that only the Sinkhorn arithmetic is compared.
-@requires_aiter
+@requires_rocm
 def test_task2_each_sinkhorn_round_matches_reference():
     fn, scale, base = _task2_params()
     residual = _exact_residual(256, 6)
-    op = _OPS["rlkernel_config"]
+    op = _OP
     logits = op(residual, fn, scale, base, sinkhorn_repeat=0)[1]
     worst = {}
     for rounds in range(1, 21):
@@ -306,12 +274,12 @@ def test_task2_each_sinkhorn_round_matches_reference():
 
 # Split and POST multiplier: post_mix = mult * sigmoid(logit) for the post rows,
 # with the logit computed on the host in the kernel's operation order.
-@requires_aiter
+@requires_rocm
 @pytest.mark.parametrize("mult", [2.0, 3.0])
 def test_task2_post_mix_split_and_multiplier(mult):
     fn, scale, base = _task2_params()
     residual = _exact_residual(256, 7)
-    post = _OPS["rlkernel_config"](residual, fn, scale, base, hc_post_mult_value=mult)[0]
+    post = _OP(residual, fn, scale, base, hc_post_mult_value=mult)[0]
     x = residual.float().flatten(-2)
     r_inv = 1.0 / torch.sqrt(x.square().sum(-1, keepdim=True) / _K + _EPS)
     logit = r_inv * scale[1] * (x @ fn[_POST].t()) + base[_POST]
@@ -332,19 +300,19 @@ _EXTREME_RES_LOGITS = pytest.mark.parametrize(
 
 # Extreme logits: with a zero fn and scale 0 the logits equal base exactly.
 @_EXTREME_RES_LOGITS
-@requires_aiter
+@requires_rocm
 def test_task2_sinkhorn_extreme_logits(res_logits):
     base = torch.zeros(_MIX, device="cuda")
     base[_RES] = res_logits.cuda()
     fn = torch.zeros(_MIX, _K, device="cuda")
     residual = _normal_residual(16, 8)
-    comb = _OPS["rlkernel_config"](residual, fn, torch.zeros(3, device="cuda"), base)[1]
+    comb = _OP(residual, fn, torch.zeros(3, device="cuda"), base)[1]
     expected = sinkhorn_dsv4(base[_RES].view(1, _N, _N), 20, _EPS).expand(16, _N, _N)
     assert torch.isfinite(comb).all()
     assert (comb - expected).abs().max() < 2e-6
 
 
-# Gradient under the same extreme logits, through aiter's PyTorch backward and
+# Gradient under the same extreme logits, through the op's PyTorch-recompute backward and
 # the fp32 reference. Construction: one-hot fn on the res rows only and
 # scale = (0, 0, 0.1), so each res logit is base + 0.1 * x_k / r for one input
 # element x_k: within a few tenths of the extreme base values, but with a
@@ -352,7 +320,7 @@ def test_task2_sinkhorn_extreme_logits(res_logits):
 # passes through Sinkhorn, the projection and RMS. That gradient is scaled by
 # 100 so dResidual reaches O(1) where the absolute tolerance is not loose.
 @_EXTREME_RES_LOGITS
-@requires_aiter
+@requires_rocm
 def test_task2_sinkhorn_extreme_logits_grad(res_logits):
     m = 16
     base = torch.zeros(_MIX, device="cuda")
@@ -365,7 +333,7 @@ def test_task2_sinkhorn_extreme_logits_grad(res_logits):
         100.0 * torch.randn(m, _N, _N, generator=_gen(18), device="cuda"),
         torch.zeros(m, _C, device="cuda", dtype=torch.bfloat16),
     ]
-    _, grad = _pre_forward_backward(_OPS["rlkernel_config"], residual, fn, scale, base, grads)
+    _, grad = _pre_forward_backward(_OP, residual, fn, scale, base, grads)
     _, ref_grad = _pre_forward_backward(
         NativeMHCPreOp().forward_fp32, residual, fn, scale, base, grads
     )
@@ -399,16 +367,17 @@ def _exact_pre_weights():
     return torch.where(_PRE_BIAS > 0, one + _EPS, torch.tensor(_EPS)).cuda()
 
 
-@pytest.mark.parametrize("config,m", _config_and_m(default_split_k_may_differ=False))
-def test_task3_aggregation_batch_invariance(config, m):
+@requires_rocm
+@pytest.mark.parametrize("m", _M_VALUES)
+def test_task3_aggregation_batch_invariance(m):
     fn, scale, base = _task3_params()
-    case = _case("layer_input", _OPS[config], _normal_residual, fn, scale, base, 2)
+    case = _case("layer_input", _OP, _normal_residual, fn, scale, base, 2)
     _assert_batch_invariant(case, m)
 
 
 # Precondition of the task-3 isolation: the pre weights really are the exact
 # constants. With only stream i nonzero, layer_input must equal bf16(w_i * x_i).
-@requires_aiter
+@requires_rocm
 def test_task3_pre_weights_are_exact():
     fn, scale, base = _task3_params()
     w = _exact_pre_weights()
@@ -416,38 +385,36 @@ def test_task3_pre_weights_are_exact():
     for i in range(_N):
         residual = torch.zeros(256, _N, _C, device="cuda", dtype=torch.bfloat16)
         residual[:, i] = _normal_residual(256, 20 + i)[:, i]
-        layer_input = _OPS["rlkernel_config"](residual, fn, scale, base)[2]
+        layer_input = _OP(residual, fn, scale, base)[2]
         if not bits_equal(layer_input, (w[i] * residual[:, i].float()).to(torch.bfloat16)):
             differing.append(i)
     assert not differing, f"streams whose pre weight is not the expected constant: {differing}"
 
 
-# Summation order and cast point. aiter sums the four streams as
-#   fma(w2, x2, w0 * x0) + fma(w3, x3, w1 * x1)
-# in fp32 and casts to bf16 once at the end: streams two apart are paired, each
-# pair is one fused multiply-add. Found on MI325X by comparing against all 24
-# sequential orders, the 3 pairwise groupings and their FMA variants; only this
-# one matched every element. Fails if aiter changes it.
-@requires_aiter
+# Summation order and cast point, as written in the kernel: the four streams are
+# added one fused multiply-add at a time in stream order,
+#   fma(w3, x3, fma(w2, x2, fma(w1, x1, w0 * x0)))
+# in fp32, and cast to bf16 once at the end.
+@requires_rocm
 def test_task3_aggregation_order_and_bf16_cast():
     fn, scale, base = _task3_params()
     residual = _normal_residual(1024, 12)
-    layer_input = _OPS["rlkernel_config"](residual, fn, scale, base)[2]
+    layer_input = _OP(residual, fn, scale, base)[2]
     w = _exact_pre_weights().double()
     x = residual.double()
 
-    def fma(i, j):
-        """w_i * x_i + fl(w_j * x_j) with one rounding (exact product in fp64)."""
-        return (w[i] * x[:, i] + (w[j] * x[:, j]).float().double()).float()
-
-    expected = (fma(2, 0) + fma(3, 1)).to(torch.bfloat16)
+    acc = (w[0] * x[:, 0]).float()
+    for i in range(1, _N):
+        # One rounding: the product and the sum are exact in fp64 for these inputs.
+        acc = (w[i] * x[:, i] + acc.double()).float()
+    expected = acc.to(torch.bfloat16)
     assert bits_equal(layer_input, expected)
 
 
-@requires_aiter
+@requires_rocm
 def test_task3_empty_batch():
     fn, scale, base = _task3_params()
-    outputs = _OPS["rlkernel_config"](_normal_residual(0, 13), fn, scale, base)
+    outputs = _OP(_normal_residual(0, 13), fn, scale, base)
     assert [tuple(o.shape) for o in outputs] == [(0, _N), (0, _N, _N), (0, _C)]
 
 
@@ -457,7 +424,7 @@ def test_task3_empty_batch():
 # ---------------------------------------------------------------------------
 
 
-@requires_aiter
+@requires_rocm
 def test_pre_matches_reference_forward_and_grad():
     fn = _random_fn()
     scale = 0.5 + torch.rand(3, generator=_gen(14), device="cuda")
@@ -468,7 +435,7 @@ def test_pre_matches_reference_forward_and_grad():
         torch.randn(64, _N, _N, device="cuda"),
         torch.randn(64, _C, device="cuda").to(torch.bfloat16),
     ]
-    outputs, grad = _pre_forward_backward(_OPS["rlkernel_config"], residual, fn, scale, base, grads)
+    outputs, grad = _pre_forward_backward(_OP, residual, fn, scale, base, grads)
     ref_outputs, ref_grad = _pre_forward_backward(
         NativeMHCPreOp().forward_fp32, residual, fn, scale, base, grads
     )
@@ -481,11 +448,12 @@ def test_pre_matches_reference_forward_and_grad():
     )
 
 
-@requires_aiter
-def test_registry_selects_aiter_on_rocm():
-    assert type(kernel_registry.get_op("mhc_pre", device="cuda")).__name__ == "AiterMHCPreOp"
+@requires_rocm
+def test_registry_selects_the_triton_op_on_rocm():
+    assert type(kernel_registry.get_op("mhc_pre", device="cuda")).__name__ == "TritonMHCPreOp"
 
 
+# The aiter op's table (kept as the benchmark baseline until the aiter path is removed).
 def test_shipped_table_loads_and_is_used(monkeypatch):
     monkeypatch.setattr(config_utils, "_device_arch", lambda index: "gfx942")
     config_utils.load_table.cache_clear()
@@ -509,7 +477,7 @@ def test_shipped_table_loads_and_is_used(monkeypatch):
 def test_semantic_descriptor_declares_forward_batch_invariance_on_rocm():
     resolution = kernel_registry.semantic.session().resolve(
         semantic_op="mhc_pre",
-        requested_backend="rlkernel.rocm.aiter_mhc_pre_dsv4.batch_invariant.v1",
+        requested_backend="rlkernel.rocm.triton_mhc_pre_dsv4.batch_invariant.v1",
         target="rollout",
         requirements=OperatorRequirements(
             device="rocm", dtype="bfloat16", alignment_properties={"batch_invariant": True}
@@ -517,6 +485,36 @@ def test_semantic_descriptor_declares_forward_batch_invariance_on_rocm():
     )
     properties = resolution.descriptor.determinism_or_alignment_properties
     assert properties["backward_batch_invariant"] is False
+
+
+# No launch parameter changes the bits: every output of the default config equals
+# the output with each of these configs, at an M inside one tile and at a larger M.
+_LAUNCH_VARIANTS = [
+    {"BLOCK_M": 16},
+    {"BLOCK_M": 64, "num_warps": 8},
+    {"num_warps": 2, "num_stages": 2, "waves_per_eu": 2},
+    {"APPLY_BLOCK_M": 64, "APPLY_BLOCK_C": 256, "apply_num_warps": 8},
+    {"APPLY_BLOCK_M": 16, "APPLY_BLOCK_C": 64, "apply_num_warps": 2},
+    {"SINKHORN_BLOCK_M": 1},
+    {"SINKHORN_BLOCK_M": 64},
+]
+
+
+@requires_rocm
+@pytest.mark.parametrize(
+    "config", _LAUNCH_VARIANTS, ids=lambda c: "-".join(f"{k}={v}" for k, v in c.items())
+)
+def test_launch_config_does_not_change_bits(config):
+    fn = _random_fn()
+    scale = 0.5 + torch.rand(3, generator=_gen(30), device="cuda")
+    base = 0.1 * torch.randn(_MIX, generator=_gen(31), device="cuda")
+    for m in (17, 1024):
+        residual = _normal_residual(m, 32)
+        default = mhc_pre_dsv4(residual, fn, scale, base)
+        changed = mhc_pre_dsv4(residual, fn, scale, base, config=config)
+        names = ("post_mix", "comb_mix", "layer_input")
+        differing = [n for n, a, b in zip(names, default, changed) if not bits_equal(a, b)]
+        assert not differing, f"M={m}: {differing}"
 
 
 # Unsupported inputs raise instead of running unvalidated (checked on CPU).

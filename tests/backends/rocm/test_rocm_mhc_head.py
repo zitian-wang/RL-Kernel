@@ -7,43 +7,37 @@ tests/backends/rocm/test_rocm_mhc_batch_invariance.py, those of the DeepSeek-V4
 layer end in tests/models/deepseek_v4/test_layer_end_batch_invariance.py; the
 reference itself in
 tests/reference/test_mhc_reference.py. This file holds what only applies to
-the aiter op: it matches the fp32 reference in its output and residual
-gradient; empty batch, the shipped table, the registry selection and the
-semantic descriptor.
+the ROCm op (``TritonMHCHeadOp``): it matches the fp32 reference in its output
+and residual gradient; launch configs do not change its bits; empty batch, the
+registry selection and the semantic descriptor; and the shipped table of the
+aiter op, kept as the benchmark baseline.
 """
 
 import pytest
 import torch
 
 from rl_engine.backends.rocm import config_utils
-from rl_engine.backends.rocm.mhc.aiter_mhc import (
-    FIXED_HEAD_CONFIG,
-    HEAD_BIT_PARAMS,
-    check_head_inputs,
-)
+from rl_engine.backends.rocm.mhc.aiter_mhc import FIXED_HEAD_CONFIG, HEAD_BIT_PARAMS
+from rl_engine.backends.rocm.mhc.triton_mhc import check_head_inputs, mhc_head_dsv4
 from rl_engine.reference.mhc import NativeMHCHeadOp
 from rl_engine.runtime.registry import kernel_registry
 from rl_engine.runtime.semantic_registry import OperatorRequirements
+from rl_engine.validation.common.batch_invariance import bits_equal
 from tests.helpers.contract_tolerance import assert_matches_fp32_reference
 
 _N, _C = 4, 4096  # DeepSeek-V4-Flash-0731: hc_mult, hidden_size
 
 
-def _aiter_head_op():
+def _head_op():
     if not (torch.cuda.is_available() and torch.version.hip is not None):
         return None
-    try:
-        from rl_engine.backends.rocm.mhc.aiter_mhc import AiterMHCHeadOp
+    from rl_engine.backends.rocm.mhc.triton_mhc import TritonMHCHeadOp
 
-        return AiterMHCHeadOp()
-    except RuntimeError:
-        return None
+    return TritonMHCHeadOp()
 
 
-_AITER_OP = _aiter_head_op()
-requires_aiter = pytest.mark.skipif(
-    _AITER_OP is None, reason="ROCm GPU with aiter DeepSeek-V4 mHC ops required."
-)
+_OP = _head_op()
+requires_rocm = pytest.mark.skipif(_OP is None, reason="ROCm GPU required.")
 
 
 def _params():
@@ -67,14 +61,14 @@ def _forward_backward(op, residual, grad_out):
     return out.detach(), leaf.grad.detach()
 
 
-# Correctness: aiter mHC head output and residual gradient against the fp32 reference.
+# Correctness: mHC head output and residual gradient against the fp32 reference.
 # Only the residual gradient is checked: head parameters are frozen in the first
 # round (LoRA-only training).
-@requires_aiter
+@requires_rocm
 def test_matches_reference_forward_and_grad():
     residual = _residual(64, seed=10)
     grad_out = _residual(64, seed=11)[:, 0]
-    out, grad = _forward_backward(_AITER_OP, residual, grad_out)
+    out, grad = _forward_backward(_OP, residual, grad_out)
     ref_out, ref_grad = _forward_backward(NativeMHCHeadOp().forward_fp32, residual, grad_out)
     assert_matches_fp32_reference(
         out, ref_out, judgment="forward_accuracy", op_class="reduction", name="head"
@@ -84,16 +78,37 @@ def test_matches_reference_forward_and_grad():
     )
 
 
-@requires_aiter
+# No launch parameter changes the bits.
+@requires_rocm
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"BLOCK_M": 16},
+        {"BLOCK_M": 64, "num_warps": 8},
+        {"num_warps": 2, "num_stages": 2, "waves_per_eu": 2},
+        {"APPLY_BLOCK_M": 64, "APPLY_BLOCK_C": 256, "apply_num_warps": 8},
+        {"APPLY_BLOCK_M": 16, "APPLY_BLOCK_C": 64, "apply_num_warps": 2},
+    ],
+    ids=lambda c: "-".join(f"{k}={v}" for k, v in c.items()),
+)
+def test_launch_config_does_not_change_bits(config):
+    for m in (17, 1024):
+        residual = _residual(m, seed=40)
+        default = mhc_head_dsv4(residual, *_params())
+        assert bits_equal(mhc_head_dsv4(residual, *_params(), config=config), default), f"M={m}"
+
+
+@requires_rocm
 def test_empty_batch_forward():
-    assert _AITER_OP(_residual(0, seed=50), *_params()).shape == (0, _C)
+    assert _OP(_residual(0, seed=50), *_params()).shape == (0, _C)
 
 
-@requires_aiter
-def test_registry_selects_aiter_on_rocm():
-    assert type(kernel_registry.get_op("mhc_head", device="cuda")).__name__ == "AiterMHCHeadOp"
+@requires_rocm
+def test_registry_selects_the_triton_op_on_rocm():
+    assert type(kernel_registry.get_op("mhc_head", device="cuda")).__name__ == "TritonMHCHeadOp"
 
 
+# The aiter op's table (kept as the benchmark baseline until the aiter path is removed).
 def test_shipped_table_loads_and_is_used(monkeypatch):
     monkeypatch.setattr(config_utils, "_device_arch", lambda index: "gfx942")
     config_utils.load_table.cache_clear()
@@ -117,7 +132,7 @@ def test_shipped_table_loads_and_is_used(monkeypatch):
 def test_semantic_descriptor_declares_forward_batch_invariance_on_rocm():
     resolution = kernel_registry.semantic.session().resolve(
         semantic_op="mhc_head",
-        requested_backend="rlkernel.rocm.aiter_mhc_head_dsv4.batch_invariant.v1",
+        requested_backend="rlkernel.rocm.triton_mhc_head_dsv4.batch_invariant.v1",
         target="rollout",
         requirements=OperatorRequirements(
             device="rocm", dtype="bfloat16", alignment_properties={"batch_invariant": True}

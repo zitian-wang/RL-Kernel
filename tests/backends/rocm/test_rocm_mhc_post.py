@@ -5,17 +5,18 @@
 Batch invariance and determinism are checked for all mHC ops together in
 tests/backends/rocm/test_rocm_mhc_batch_invariance.py; the reference itself in
 tests/reference/test_mhc_reference.py. This file holds what only applies to
-the aiter op:
+the ROCm op (``TritonMHCPostOp``):
 
 - it matches the fp32 reference in R_new, dy, dR_old, dPOST and dC;
 - the old residual is added exactly once;
+- launch configs do not change its bits;
 - empty batch, the registry selection and the semantic descriptor.
 """
 
 import pytest
 import torch
 
-from rl_engine.backends.rocm.mhc.aiter_mhc import check_post_inputs
+from rl_engine.backends.rocm.mhc.triton_mhc import check_post_inputs, mhc_post_dsv4
 from rl_engine.reference.mhc import NativeMHCPostOp
 from rl_engine.runtime.registry import kernel_registry
 from rl_engine.runtime.semantic_registry import OperatorRequirements
@@ -26,21 +27,16 @@ _N, _C = 4, 4096  # DeepSeek-V4-Flash-0731: hc_mult, hidden_size
 _GRAD_NAMES = ("dy", "dR_old", "dPOST", "dC")
 
 
-def _aiter_post_op():
+def _post_op():
     if not (torch.cuda.is_available() and torch.version.hip is not None):
         return None
-    try:
-        from rl_engine.backends.rocm.mhc.aiter_mhc import AiterMHCPostOp
+    from rl_engine.backends.rocm.mhc.triton_mhc import TritonMHCPostOp
 
-        return AiterMHCPostOp()
-    except RuntimeError:
-        return None
+    return TritonMHCPostOp()
 
 
-_AITER_OP = _aiter_post_op()
-requires_aiter = pytest.mark.skipif(
-    _AITER_OP is None, reason="ROCm GPU with aiter DeepSeek-V4 mHC ops required."
-)
+_OP = _post_op()
+requires_rocm = pytest.mark.skipif(_OP is None, reason="ROCm GPU required.")
 
 
 def _inputs(m, *, seed, device="cuda"):
@@ -64,11 +60,11 @@ def _forward_backward(op, inputs, grad_out):
     return out.detach(), [t.grad.detach() for t in leaves]
 
 
-# Correctness: aiter output and gradients against the fp32 reference.
-@requires_aiter
+# Correctness: output and gradients against the fp32 reference.
+@requires_rocm
 def test_matches_reference_forward_and_grads():
     inputs, grad_out = _inputs(64, seed=10)
-    out, grads = _forward_backward(_AITER_OP, inputs, grad_out)
+    out, grads = _forward_backward(_OP, inputs, grad_out)
     ref_out, ref_grads = _forward_backward(NativeMHCPostOp().forward_fp32, inputs, grad_out)
     assert_matches_fp32_reference(
         out, ref_out, judgment="forward_accuracy", op_class="reduction", name="R_new"
@@ -81,29 +77,43 @@ def test_matches_reference_forward_and_grads():
 
 # Residual added once: with comb_mix = identity and post_mix = 0 the output must
 # be exactly the old residual. A second residual add would double it.
-@requires_aiter
+@requires_rocm
 def test_residual_added_once():
     (y, residual, post_mix, _), _ = _inputs(64, seed=11)
     comb_identity = torch.eye(_N, device="cuda").expand(64, _N, _N)
-    out = _AITER_OP(y, residual, torch.zeros_like(post_mix), comb_identity)
+    out = _OP(y, residual, torch.zeros_like(post_mix), comb_identity)
     assert bits_equal(out, residual)
 
 
-@requires_aiter
+# No launch parameter changes the bits.
+@requires_rocm
+@pytest.mark.parametrize(
+    "config",
+    [{"BLOCK_M": 16}, {"BLOCK_M": 32, "BLOCK_C": 64, "num_warps": 8}, {"waves_per_eu": 0}],
+    ids=lambda c: "-".join(f"{k}={v}" for k, v in c.items()),
+)
+def test_launch_config_does_not_change_bits(config):
+    for m in (17, 1024):
+        inputs, _ = _inputs(m, seed=61)
+        default = mhc_post_dsv4(*inputs)
+        assert bits_equal(mhc_post_dsv4(*inputs, config=config), default), f"M={m}"
+
+
+@requires_rocm
 def test_empty_batch_forward():
     inputs, _ = _inputs(0, seed=60)
-    assert _AITER_OP(*inputs).shape == (0, _N, _C)
+    assert _OP(*inputs).shape == (0, _N, _C)
 
 
-@requires_aiter
-def test_registry_selects_aiter_on_rocm():
-    assert type(kernel_registry.get_op("mhc_post", device="cuda")).__name__ == "AiterMHCPostOp"
+@requires_rocm
+def test_registry_selects_the_triton_op_on_rocm():
+    assert type(kernel_registry.get_op("mhc_post", device="cuda")).__name__ == "TritonMHCPostOp"
 
 
 def test_semantic_descriptor_declares_forward_batch_invariance_on_rocm():
     resolution = kernel_registry.semantic.session().resolve(
         semantic_op="mhc_post",
-        requested_backend="rlkernel.rocm.aiter_mhc_post_dsv4.batch_invariant.v1",
+        requested_backend="rlkernel.rocm.triton_mhc_post_dsv4.batch_invariant.v1",
         target="rollout",
         requirements=OperatorRequirements(
             device="rocm", dtype="bfloat16", alignment_properties={"batch_invariant": True}

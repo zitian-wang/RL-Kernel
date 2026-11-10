@@ -15,25 +15,12 @@ import torch.nn.functional as F
 from rl_engine.reference.mhc import NativeMHCHeadOp
 from rl_engine.reference.norm.rms_norm import NativeRMSNormOp
 from tests.helpers.contract_tolerance import assert_matches_fp32_reference
+from tests.helpers.deepseek_v4_mhc import rocm_gpu_available
 
 _N, _C, _V = 4, 4096, 4096  # DeepSeek-V4-Flash-0731 hc_mult and hidden_size; test vocabulary
 
 
-def _aiter_available():
-    if not (torch.cuda.is_available() and torch.version.hip is not None):
-        return False
-    try:
-        from rl_engine.backends.rocm.mhc.aiter_mhc import AiterMHCHeadOp
-
-        AiterMHCHeadOp()
-        return True
-    except RuntimeError:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _aiter_available(), reason="ROCm GPU with aiter DeepSeek-V4 mHC ops required."
-)
+pytestmark = pytest.mark.skipif(not rocm_gpu_available(), reason="ROCm GPU required.")
 
 
 def _weights():

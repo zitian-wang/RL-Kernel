@@ -14,8 +14,8 @@ C = 4096:
 - run-to-run determinism of forward and backward;
 - forward with grad (training) equals forward without grad (inference).
 
-Backward batch invariance is checked too but is expected to fail: aiter's mHC
-head backward recomputes the formula in PyTorch. The mHC pre, mHC post and mHC
+Backward batch invariance is checked too but is expected to fail: the mHC head
+backward recomputes the formula in PyTorch, as aiter's does. The mHC pre, mHC post and mHC
 head ops alone are checked in
 tests/backends/rocm/test_rocm_mhc_batch_invariance.py.
 """
@@ -35,17 +35,15 @@ from tests.helpers.deepseek_v4_mhc import (
     M_VALUES,
     N,
     V,
-    aiter_mhc_available,
     forward_backward,
     randn,
+    rocm_gpu_available,
     weights,
 )
 
 _C = 4096  # DeepSeek-V4-Flash-0731 hidden_size
 
-pytestmark = pytest.mark.skipif(
-    not aiter_mhc_available(), reason="ROCm GPU with aiter DeepSeek-V4 mHC ops required."
-)
+pytestmark = pytest.mark.skipif(not rocm_gpu_available(), reason="ROCm GPU required.")
 
 
 @pytest.fixture(scope="module")
@@ -122,7 +120,7 @@ def test_forward_with_and_without_grad_identical(cases):
     assert not differing, differing
 
 
-@pytest.mark.xfail(reason="aiter recomputes mHC head backward in PyTorch; not batch invariant")
+@pytest.mark.xfail(reason="mHC head backward recomputes in PyTorch; not batch invariant")
 @pytest.mark.parametrize("m", [m for m in M_VALUES if m > 1])
 def test_backward_batch_invariance(cases, m):
     _, backward = cases

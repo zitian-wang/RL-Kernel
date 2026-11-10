@@ -10,7 +10,7 @@ import inspect
 import pytest
 import torch
 
-from rl_engine.backends.rocm.mhc import aiter_mhc
+from rl_engine.backends.rocm.mhc import triton_mhc
 from rl_engine.contracts.operators import mhc as contract
 from rl_engine.reference.mhc import NativeMHCHeadOp, NativeMHCPreOp, sinkhorn_dsv4
 from rl_engine.runtime.registry import _default_semantic_descriptors
@@ -35,19 +35,19 @@ def test_describe_reports_provenance(op):
     assert info["batch_invariance"]["forward"] is True
     assert info["batch_invariance"]["backward"] is False
     assert info["batch_invariance"]["validated_on"] == "gfx942"
-    assert len(info["open_items"]) == 2
+    assert len(info["open_items"]) == 1
     assert info["arithmetic"]["downcast_points"]
 
 
 def test_describe_returns_copies():
     info = contract.describe("mhc_pre")
     info["shapes"]["residual"] = "changed"
-    info["arithmetic"]["bit_params"].append("changed")
+    info["arithmetic"]["arithmetic_constants"]["NUM_KSPLIT"] = 1
     info["batch_invariance"]["forward"] = False
 
     fresh = contract.describe("mhc_pre")
     assert fresh["shapes"]["residual"] == "[..., n, C] bf16"
-    assert fresh["arithmetic"]["bit_params"] == list(contract.PRE_BIT_PARAMS)
+    assert fresh["arithmetic"]["arithmetic_constants"] == contract.ARITHMETIC_CONSTANTS
     assert fresh["batch_invariance"]["forward"] is True
 
 
@@ -56,10 +56,13 @@ def test_describe_rejects_unknown_ops():
         contract.describe("mhc_tail")
 
 
-def test_bit_params_match_the_rocm_backend():
-    assert contract.PRE_BIT_PARAMS == aiter_mhc.PRE_BIT_PARAMS
-    assert contract.HEAD_BIT_PARAMS == aiter_mhc.HEAD_BIT_PARAMS
-    assert contract.HC_MULT == aiter_mhc.SUPPORTED_N
+def test_arithmetic_constants_match_the_rocm_backend():
+    assert contract.ARITHMETIC_CONSTANTS == {
+        "NUM_KSPLIT": triton_mhc.NUM_KSPLIT,
+        "BLOCK_K": triton_mhc.BLOCK_K,
+        **triton_mhc.DOT_OPTIONS,
+    }
+    assert contract.HC_MULT == triton_mhc.SUPPORTED_N
 
 
 def test_defaults_match_the_reference_and_the_rocm_backend():
@@ -73,9 +76,9 @@ def test_defaults_match_the_reference_and_the_rocm_backend():
     head = {"rms_eps": contract.RMS_EPS, "hc_pre_eps": contract.HC_PRE_EPS}
 
     assert _defaults(NativeMHCPreOp._pre) == pre
-    assert _defaults(aiter_mhc.AiterMHCPreOp.__call__) == pre
+    assert _defaults(triton_mhc.TritonMHCPreOp.__call__) == pre
     assert _defaults(NativeMHCHeadOp.forward) == head
-    assert _defaults(aiter_mhc.AiterMHCHeadOp.__call__) == head
+    assert _defaults(triton_mhc.TritonMHCHeadOp.__call__) == head
 
 
 def test_pre_fn_rows_matches_the_reference_shape_check():

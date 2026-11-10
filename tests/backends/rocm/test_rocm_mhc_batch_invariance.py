@@ -8,23 +8,19 @@ is wrapped as a row-wise case and run through the shared checks in
 rl_engine.validation.common.batch_invariance:
 
 - forward batch invariance at M = 1, 16, 17 (RFC switch points), the WS1
-  manifest's token counts 8 and 59, aiter's K-split switch points
-  1024 ... 16384, and the upper bound of every bucket of the gfx942 mHC pre
-  and mHC head tables, so every tuned config runs;
+  manifest's token counts 8 and 59, and powers of two up to 16384;
 - chunking, reordering and padding;
 - the same inputs in non-contiguous views (other strides);
 - run-to-run determinism of forward and backward;
-- forward with grad (training) equals forward without grad (inference);
-- which launch configs ran.
+- forward with grad (training) equals forward without grad (inference).
 
-Every op runs at DeepSeek-V4-Flash's C = 4096, which has tuned launch-config
-tables on gfx942, and at C = 7168, which has none and is not a power of two,
-so the default configs are checked too. The DeepSeek-V4 layer end is checked
-in tests/models/deepseek_v4/test_layer_end_batch_invariance.py.
+Every op runs at DeepSeek-V4-Flash's C = 4096 and at C = 7168, which is not a
+power of two. The DeepSeek-V4 layer end is checked in
+tests/models/deepseek_v4/test_layer_end_batch_invariance.py.
 
-Backward batch invariance is checked too but is expected to fail: aiter's
-backward recomputes the formula in PyTorch. It is not an acceptance item for
-these tasks (the backward belongs to task 6).
+Backward batch invariance is checked too but is expected to fail: the backward
+recomputes the formula in PyTorch, as aiter's does. It is not an acceptance
+item for these tasks (the backward belongs to task 6).
 """
 
 import pytest
@@ -41,19 +37,17 @@ from rl_engine.validation.common.batch_invariance import (
 from tests.helpers.deepseek_v4_mhc import (
     M_VALUES,
     N,
-    aiter_mhc_available,
     forward_backward,
     randn,
+    rocm_gpu_available,
     weights,
 )
 
-# (op, C): every op at the tuned C = 4096 and at an untuned C.
+# (op, C): every op at DeepSeek-V4-Flash's C = 4096 and at a C that is not a power of two.
 _OP_C = [(op, c) for c in (4096, 7168) for op in ("mhc_pre", "mhc_post", "mhc_head")]
 _OP_C_IDS = [f"{op}-C{c}" for op, c in _OP_C]
 
-pytestmark = pytest.mark.skipif(
-    not aiter_mhc_available(), reason="ROCm GPU with aiter DeepSeek-V4 mHC ops required."
-)
+pytestmark = pytest.mark.skipif(not rocm_gpu_available(), reason="ROCm GPU required.")
 
 
 def _cases(c):
@@ -191,32 +185,7 @@ def test_forward_with_and_without_grad_identical(cases, op, c):
     assert not differing, f"{op}, C={c}: {differing}"
 
 
-# Which launch configs actually ran: the tuned table at C = 4096 on gfx942, the
-# default config everywhere else. Printed so the test log records them.
-@pytest.mark.parametrize(
-    "op,c",
-    [(op, c) for op, c in _OP_C if op in ("mhc_pre", "mhc_head")],
-    ids=[i for (op, _), i in zip(_OP_C, _OP_C_IDS) if op in ("mhc_pre", "mhc_head")],
-)
-def test_launch_configs_that_ran(cases, op, c):
-    from rl_engine.backends.rocm import config_utils
-
-    forward, _ = cases(op, c)
-    forward.run(forward.make_rows(17, 0))
-    records = [
-        r
-        for r in config_utils.selected_configs()
-        if r["op"] == op
-        and r["file"].endswith(f"-C={c}.json")
-        and r["m_min"] <= 17 <= r["m_max"]
-    ]
-    print(records)
-    assert len(records) == 1
-    tuned = c == 4096 and records[0]["arch"] == "gfx942"
-    assert (records[0]["source"] != "default") == tuned
-
-
-@pytest.mark.xfail(reason="aiter recomputes backward in PyTorch; not batch invariant")
+@pytest.mark.xfail(reason="backward recomputes in PyTorch, as aiter's; not batch invariant")
 @pytest.mark.parametrize("m", [m for m in M_VALUES if m > 1])
 @pytest.mark.parametrize("op,c", _OP_C, ids=_OP_C_IDS)
 def test_backward_batch_invariance(cases, op, c, m):

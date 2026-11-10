@@ -4,31 +4,16 @@
 
 import torch
 
-from tests.helpers.rocm_launch_configs import bucket_bounds
-
 N, V = 4, 4096  # DeepSeek-V4-Flash-0731 hc_mult; test vocabulary
 
 # M = 1, 16, 17 (RFC switch points), the WS1 manifest's token counts 8 and 59,
-# aiter's K-split switch points 1024 ... 16384, and the upper bound of every
-# bucket of the gfx942 mHC pre and mHC head tables, so every tuned config runs.
-M_VALUES = sorted(
-    {1, 8, 16, 17, 59, 1024, 2048, 4096, 8192, 16384}
-    | set(bucket_bounds("mhc_pre", f"MHC_PRE-n={N}-C=4096.json"))
-    | set(bucket_bounds("mhc_head", f"MHC_HEAD-n={N}-C=4096.json"))
-)
+# and powers of two up to 16384.
+M_VALUES = [1, 8, 16, 17, 59, 64, 128, 256, 1024, 2048, 4096, 8192, 16384]
 
 
-def aiter_mhc_available() -> bool:
-    """True on a ROCm GPU where aiter's DeepSeek-V4 mHC ops import."""
-    if not (torch.cuda.is_available() and torch.version.hip is not None):
-        return False
-    try:
-        from rl_engine.backends.rocm.mhc.aiter_mhc import AiterMHCPostOp
-
-        AiterMHCPostOp()
-        return True
-    except RuntimeError:
-        return False
+def rocm_gpu_available() -> bool:
+    """True on a ROCm GPU, where the Triton mHC ops run."""
+    return torch.cuda.is_available() and torch.version.hip is not None
 
 
 def randn(gen, *shape):
