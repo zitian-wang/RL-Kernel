@@ -62,8 +62,9 @@ PRE_CONFIG = {
     "SINKHORN_BLOCK_M": 16,
 }
 HEAD_CONFIG = {k: v for k, v in PRE_CONFIG.items() if k != "SINKHORN_BLOCK_M"}
-# aiter 326cffa's mhc_post config on gfx942 (mhc_post/DEFAULT.json), which does not depend on M.
-POST_CONFIG = {"BLOCK_M": 64, "BLOCK_C": 256, "num_warps": 4, "num_stages": 1, "waves_per_eu": 2}
+# aiter 326cffa's mhc_post config on gfx942 (mhc_post/DEFAULT.json) with BLOCK_M = 16 instead of
+# 64: on MI325X (C = 4096) it took 0.03-0.20 of the time of aiter's config from M = 1 to 65536.
+POST_CONFIG = {"BLOCK_M": 16, "BLOCK_C": 256, "num_warps": 4, "num_stages": 1, "waves_per_eu": 2}
 
 # DeepSeek-V4's hc_mult; the ops are validated with it only.
 SUPPORTED_N = 4

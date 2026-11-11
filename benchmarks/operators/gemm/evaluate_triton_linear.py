@@ -71,7 +71,8 @@ EXTRA_CONFIGS = [
     dict(_BASE, BLOCK_SIZE_M=128, BLOCK_SIZE_N=256, num_warps=8, GROUP_SIZE_M=4),
     dict(_BASE, BLOCK_SIZE_M=256, BLOCK_SIZE_N=128, num_warps=8, GROUP_SIZE_M=8),
 ]
-CANDIDATES = [config for _, config in triton_gemm.CONFIGS] + EXTRA_CONFIGS
+CANDIDATES = triton_gemm.distinct_configs()
+CANDIDATES += [c for c in EXTRA_CONFIGS if c not in CANDIDATES]
 
 
 def _label(config):
@@ -193,7 +194,8 @@ def section_dynamic_shape():
         "## 3. Dynamic shape",
         "",
         "Compiled variants of `_gemm_a16_w16_kernel` for the lm_head shape: before any call, "
-        f"after `warmup` ({len(triton_gemm.CONFIGS)} configs in CONFIGS), and after calls at "
+        f"after `warmup` ({len(triton_gemm.distinct_configs())} different configs in CONFIGS), "
+        "and after calls at "
         f"M = {UNSEEN_M}.",
         "",
         "| before (variants) | after warmup (variants) | after the unseen M (variants) |",

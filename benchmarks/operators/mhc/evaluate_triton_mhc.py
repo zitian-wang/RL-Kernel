@@ -145,13 +145,17 @@ def _flat_pre(out):
 
 
 def ours(pre_w, head_w):
-    """{op: callable(inputs, config=None) -> outputs}, inputs as made by make_inputs."""
+    """{op: callable(inputs, config=None) -> outputs}, inputs as made by make_inputs.
+
+    The launchers need a contiguous residual (the ops make it contiguous themselves)."""
     return {
         "pre": lambda r, config=None: _flat_pre(
-            triton_mhc.mhc_pre_dsv4(r, *pre_w, config=config)
+            triton_mhc.mhc_pre_dsv4(r.contiguous(), *pre_w, config=config)
         ),
         "post": lambda inputs, config=None: [triton_mhc.mhc_post_dsv4(*inputs, config=config)],
-        "head": lambda r, config=None: [triton_mhc.mhc_head_dsv4(r, *head_w, config=config)],
+        "head": lambda r, config=None: [
+            triton_mhc.mhc_head_dsv4(r.contiguous(), *head_w, config=config)
+        ],
     }
 
 

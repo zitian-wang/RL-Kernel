@@ -58,7 +58,7 @@ def test_linear_compiles_once_per_config_for_every_m():
     op.warmup(weight, out_dtype=torch.float32)
     # Other tests in the session may have compiled other shapes and dtypes already.
     warm = _variants(triton_gemm.KERNELS)
-    assert warm["_gemm_a16_w16_kernel"] >= len(triton_gemm.CONFIGS), warm
+    assert warm["_gemm_a16_w16_kernel"] >= len(triton_gemm.distinct_configs()), warm
     for m in _UNSEEN_M:
         op(torch.randn(m, 4096, device="cuda").to(torch.bfloat16), weight, out_dtype=torch.float32)
     torch.cuda.synchronize()

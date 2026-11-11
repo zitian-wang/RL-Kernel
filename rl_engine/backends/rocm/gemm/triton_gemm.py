@@ -39,8 +39,19 @@ DOT_OPTIONS = {"matrix_instr_nonkdim": 16, "kpack": 1}
 
 # (largest M, launch config): the op uses the first entry whose largest M is at
 # least its M. The configs only change how output tiles are grouped into
-# workgroups, not the bits. Not measured yet: taken from aiter's per-M table for
-# the lm_head on gfx942, with the K tile set to BLOCK_K.
+# workgroups, not the bits. Each is the fastest of nine candidates for the
+# DeepSeek-V4-Flash lm_head (N = 129280, K = 4096, fp32 output) at the M values
+# of its range, measured on MI325X with Triton 3.7 (job 68343365,
+# benchmarks/operators/gemm/evaluate_triton_linear.py).
+_TILE_256 = {
+    "BLOCK_SIZE_M": 256,
+    "BLOCK_SIZE_N": 256,
+    "GROUP_SIZE_M": 4,
+    "num_warps": 8,
+    "num_stages": 2,
+    "waves_per_eu": 1,
+    "cache_modifier": None,
+}
 CONFIGS = (
     (
         16,
@@ -55,7 +66,19 @@ CONFIGS = (
         },
     ),
     (
-        128,
+        32,
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 0,
+            "cache_modifier": ".cg",
+        },
+    ),
+    (
+        64,
         {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 128,
@@ -67,7 +90,20 @@ CONFIGS = (
         },
     ),
     (
-        1024,
+        128,
+        {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 2,
+            "waves_per_eu": 0,
+            "cache_modifier": ".cg",
+        },
+    ),
+    (256, _TILE_256),
+    (
+        512,
         {
             "BLOCK_SIZE_M": 128,
             "BLOCK_SIZE_N": 128,
@@ -78,18 +114,7 @@ CONFIGS = (
             "cache_modifier": None,
         },
     ),
-    (
-        None,
-        {
-            "BLOCK_SIZE_M": 256,
-            "BLOCK_SIZE_N": 256,
-            "GROUP_SIZE_M": 4,
-            "num_warps": 8,
-            "num_stages": 2,
-            "waves_per_eu": 1,
-            "cache_modifier": None,
-        },
-    ),
+    (None, _TILE_256),
 )
 
 SUPPORTED_OUT_DTYPES = (torch.bfloat16, torch.float32)
@@ -236,6 +261,15 @@ def _gemm_a16_w16_kernel(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
+
+
+def distinct_configs() -> list[dict]:
+    """The different launch configs of CONFIGS; each compiles once per process and shape."""
+    configs = []
+    for _, config in CONFIGS:
+        if config not in configs:
+            configs.append(config)
+    return configs
 
 
 def select_config(m: int) -> dict:

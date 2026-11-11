@@ -126,71 +126,99 @@ one workgroup per 16 tokens over all of K and C.
 - `mhc_layer_end`'s lm_head uses `batch_invariant_linear` with bf16 inputs and
   fp32 output (see [Batch-Invariant Linear](batch-invariant-linear.md)).
 
-## Performance Notes
+## Verification and Performance
 
-Not measured yet for the Triton ops; the measurement is
-`benchmarks/operators/mhc/evaluate_triton_mhc.py`, with the aiter ops and their
-config tables as the baseline. The tables below are the aiter ops before the copy.
+All numbers: AMD Instinct MI325X (gfx942), torch 2.12 with ROCm 7.14, Triton 3.7.0,
+n = 4, C = 4096, bf16 residual, fp32 `fn`, 20 Sinkhorn rounds, commit `de1ec324`,
+Slurm jobs 68343361–68343366 (2026-11-10),
+`benchmarks/operators/mhc/evaluate_triton_mhc.py`. Baseline: the aiter ops with
+their per-M config tables (`AiterMHCPreOp`, `AiterMHCPostOp`, `AiterMHCHeadOp`),
+the ops before the copy. Ours: the Triton ops.
 
-Forward device time of mHC pre, n = 4, C = 4096, bf16 residual, fp32 `fn`, 20
-Sinkhorn rounds; ms per call from GPU events, median over 5 trials of 50 calls.
-Baseline: aiter's own config (not batch invariant). Ours: the `mhc_pre` op with the
-gfx942 table. Three runs on two nodes; each cell gives the range of the three
-medians, and the ratio column the range of ours / baseline per run.
+**Correctness checks of ours.**
 
-| M | baseline: aiter's own config (ms) | ours: `mhc_pre` op (ms) | ours / baseline (ratio) |
-| --- | --- | --- | --- |
-| 1 | 0.1985–0.1986 | 0.0965–0.1176 | 0.49–0.59 |
-| 16 | 0.2431–0.2432 | 0.0982–0.1183 | 0.40–0.49 |
-| 17 | 0.2482–0.2484 | 0.0991–0.1181 | 0.40–0.48 |
-| 64 | 0.2503–0.2514 | 0.0998–0.1192 | 0.40–0.47 |
-| 100 | 0.2546–0.2553 | 0.0987–0.1187 | 0.39–0.46 |
-| 256 | 0.2549–0.2560 | 0.0986–0.1181 | 0.39–0.46 |
-| 1024 | 0.0910–0.0962 | 0.0996–0.1196 | 1.09–1.24 |
-| 2048 | 0.0910–0.0961 | 0.0991–0.1184 | 1.07–1.23 |
-| 3000 | 0.1315–0.1330 | 0.1000–0.1179 | 0.76–0.89 |
-| 4096 | 0.1395–0.1424 | 0.1158–0.1224 | 0.82–0.86 |
-| 8192 | cannot launch: needs 128 KB LDS, gfx942 has 64 KB | 0.1978–0.2076 | n/a: baseline cannot launch |
-| 16384 | 0.4458–0.5202 | 0.4047–0.5137 | 0.91–0.99 |
-| 32768 | 0.8665–0.8963 | 0.7747–0.8114 | 0.89–0.91 |
-| 65536 | 1.6500–1.7960 | 1.4913–1.6645 | 0.90–0.93 |
+| Check | Result |
+| --- | --- |
+| Tests listed under Tests below | 505 passed, 80 xfailed (backward batch invariance), 4 xpassed (the same non-strict xfail at single M values) |
+| Launch parameters: 17 changes for mHC pre, 15 for mHC head, 9 for mHC post, at M = 1, 17, 1024, 4096 | every output bit for bit the same as with the default config |
+| Compiled variants after one call and then calls at 14 unseen M from 2 to 10000 | unchanged: 1 per kernel (2 for the split kernel: one for mHC pre, one for mHC head) |
+| Batch invariance, M = 1 to 65536, chunking, reordering, padding, strides, repeated runs | mHC post: no difference. mHC pre and mHC head: the script section failed on non-contiguous inputs (a script bug, fixed; to be rerun); the tests above cover the same checks at M ≤ 16384 and passed |
+| Output digests, Triton 3.7.0 against 3.8.0, M = 17 and 1024 | the same for every output |
 
-Forward device time of mHC head, n = 4, C = 4096, bf16 residual, fp32 `head_fn`;
-ms per call from GPU events around a CUDA graph of 20 calls, median over 5
-replays, one run. Baseline: aiter's own head config, which is itself batch
-invariant. Ours: the `mhc_head` op with the gfx942 table. The output bits of ours
-and the baseline were the same at every M.
+**Error against the fp32 reference** (`NativeMHC*Op.forward_fp32`), M = 1024,
+random inputs; largest / mean absolute error.
 
-| M | baseline: aiter's head config (ms) | ours: `mhc_head` op (ms) | ours / baseline (ratio) |
-| --- | --- | --- | --- |
-| 1 | 0.8195 | 0.7440 | 0.91 |
-| 16 | 0.8319 | 0.7454 | 0.90 |
-| 17 | 0.8311 | 0.7476 | 0.90 |
-| 64 | 0.8374 | 0.7497 | 0.90 |
-| 100 | 0.8399 | 0.7458 | 0.89 |
-| 256 | 0.8396 | 0.7446 | 0.89 |
-| 1024 | 0.9042 | 0.7780 | 0.86 |
-| 2048 | 0.9101 | 0.7815 | 0.86 |
-| 3000 | 0.9121 | 0.7848 | 0.86 |
-| 4096 | 0.9153 | 0.7879 | 0.86 |
-| 5000 | 1.7825 | 1.3547 | 0.76 |
-| 8192 | 1.8948 | 1.4265 | 0.75 |
-| 16384 | 3.8658 | 2.8688 | 0.74 |
-| 32768 | 6.7690 | 5.1442 | 0.76 |
-| 65536 | 12.0018 | 10.7097 | 0.89 |
+| Variant | `post_mix` | `comb_mix` | `layer_input` | mHC post output | mHC head output |
+| --- | --- | --- | --- | --- | --- |
+| baseline | 3.601e-03 / 6.416e-04 | 1.227e-03 / 2.053e-04 | 2.182e-02 / 1.502e-03 | 3.121e-02 / 1.334e-03 | 1.893e-02 / 1.393e-03 |
+| ours | 4.172e-06 / 4.408e-07 | 1.073e-06 / 1.437e-07 | 1.562e-02 / 1.268e-03 | 3.121e-02 / 1.334e-03 | 1.562e-02 / 1.216e-03 |
 
-Measured before the port, on the KLR branch with the same aiter kernels (aiter
-`326cffa`, `AITER_TRITON_ONLY=1`), the same launch-config tables and the same
-benchmark code, on AMD Instinct MI325X (gfx942), Triton 3.7, torch 2.12, ROCm 7.14.
-Rerun the commands below to measure this branch.
+**Forward device time**, ms per call from GPU events around a CUDA graph, median
+over replays. Ratio columns: ours / baseline (below 1: ours is faster). "Ours,
+fastest config" is the fastest of 18 launch configs for mHC pre and mHC head and
+12 for mHC post, all with the same bits as the default.
+
+mHC pre:
+
+| M | baseline (ms) | ours, default config (ms) | ours, fastest config (ms) | ours default / baseline (ratio) | ours fastest / baseline (ratio) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.0556 | 0.0721 | 0.0657 | 1.30 | 1.18 |
+| 16 | 0.0505 | 0.0730 | 0.0662 | 1.45 | 1.31 |
+| 64 | 0.0660 | 0.0738 | 0.0667 | 1.12 | 1.01 |
+| 256 | 0.0589 | 0.0744 | 0.0675 | 1.26 | 1.15 |
+| 1024 | 0.0846 | 0.0864 | 0.0811 | 1.02 | 0.96 |
+| 2048 | 0.0835 | 0.1004 | 0.0961 | 1.20 | 1.15 |
+| 4096 | 0.1231 | 0.1501 | 0.1435 | 1.22 | 1.17 |
+| 8192 | 0.2106 | 0.2717 | 0.2592 | 1.29 | 1.23 |
+| 16384 | 0.4381 | 0.5376 | 0.5345 | 1.23 | 1.22 |
+| 32768 | 0.8201 | 1.0523 | 1.0261 | 1.28 | 1.25 |
+| 65536 | 1.5149 | 2.0569 | 2.0676 | 1.36 | 1.36 |
+
+Ours is slower than the baseline at every M. The `fixed_order` prototype, the same
+structure with `fn` rounded to bf16, took 0.68–0.96 of the baseline
+([reduction-order page, 7.6](mhc-reduction-order.md)); that the fp32 projection
+causes the difference is not measured yet.
+
+mHC head:
+
+| M | baseline (ms) | ours, default config (ms) | ours, fastest config (ms) | ours default / baseline (ratio) | ours fastest / baseline (ratio) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.7444 | 0.0602 | 0.0527 | 0.08 | 0.07 |
+| 16 | 0.7459 | 0.0609 | 0.0529 | 0.08 | 0.07 |
+| 64 | 0.7479 | 0.0611 | 0.0532 | 0.08 | 0.07 |
+| 256 | 0.7429 | 0.0617 | 0.0537 | 0.08 | 0.07 |
+| 1024 | 0.7767 | 0.0709 | 0.0679 | 0.09 | 0.09 |
+| 2048 | 0.7831 | 0.0858 | 0.0832 | 0.11 | 0.11 |
+| 4096 | 0.7880 | 0.1308 | 0.1126 | 0.17 | 0.14 |
+| 8192 | 1.4327 | 0.2436 | 0.1915 | 0.17 | 0.13 |
+| 16384 | 2.8810 | 0.4824 | 0.4236 | 0.17 | 0.15 |
+| 32768 | 5.1805 | 0.9499 | 0.8023 | 0.18 | 0.15 |
+| 65536 | 10.7338 | 1.8118 | 1.5258 | 0.17 | 0.14 |
+
+mHC post. The default config of this run was aiter's (`BLOCK_M=64`,
+`BLOCK_C=256`); after this run `POST_CONFIG` was changed to `BLOCK_M=16`,
+`BLOCK_C=256`, `num_warps=4`, to be measured again.
+
+| M | baseline (ms) | ours, aiter's config (ms) | ours, fastest config (ms) | fastest config | ours aiter's config / baseline (ratio) | ours fastest / baseline (ratio) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1.7296 | 1.7359 | 0.0464 | BLOCK_M=16 BLOCK_C=256 num_warps=8 | 1.00 | 0.03 |
+| 16 | 1.7371 | 1.7350 | 0.0474 | BLOCK_M=16 BLOCK_C=256 num_warps=8 | 1.00 | 0.03 |
+| 64 | 1.8153 | 1.8109 | 0.0476 | BLOCK_M=16 BLOCK_C=256 num_warps=8 | 1.00 | 0.03 |
+| 256 | 1.8340 | 1.8298 | 0.0542 | BLOCK_M=16 BLOCK_C=256 num_warps=8 | 1.00 | 0.03 |
+| 1024 | 1.8525 | 1.8469 | 0.0657 | BLOCK_M=16 BLOCK_C=256 num_warps=8 | 1.00 | 0.04 |
+| 2048 | 2.0988 | 2.0966 | 0.0725 | BLOCK_M=16 BLOCK_C=256 num_warps=8 | 1.00 | 0.03 |
+| 4096 | 2.8015 | 2.8006 | 0.1007 | BLOCK_M=16 BLOCK_C=256 num_warps=8 | 1.00 | 0.04 |
+| 8192 | 3.0418 | 3.0376 | 0.1892 | BLOCK_M=16 BLOCK_C=256 num_warps=4 | 1.00 | 0.06 |
+| 16384 | 3.7749 | 3.7789 | 0.3490 | BLOCK_M=16 BLOCK_C=256 num_warps=4 | 1.00 | 0.09 |
+| 32768 | 6.3778 | 6.3823 | 0.6408 | BLOCK_M=16 BLOCK_C=256 num_warps=4 | 1.00 | 0.10 |
+| 65536 | 6.9636 | 6.9372 | 1.4190 | BLOCK_M=16 BLOCK_C=128 num_warps=4 | 1.00 | 0.20 |
+
+Full reports: `/home/AMD/zitwang/dev/logs/rlk-triton-mhc-bi-6834336[1-6]-*`.
 
 ```bash
-python benchmarks/operators/mhc/benchmark_mhc_pre.py --output mhc_pre.md
-python benchmarks/operators/mhc/benchmark_mhc_head.py --output mhc_head.md
+python benchmarks/operators/mhc/evaluate_triton_mhc.py --sections 3,1,2,4 --output checks.md
+python benchmarks/operators/mhc/evaluate_triton_mhc.py --sections 5 --output time.md
 ```
-
-`benchmarks/tuning/tune_mhc_pre_config.py` and
-`benchmarks/tuning/tune_mhc_head_config.py` regenerate the tables.
 
 ## Tests
 
